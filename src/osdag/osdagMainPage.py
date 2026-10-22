@@ -95,32 +95,38 @@ from .get_DPI_scale import scale
 
 ############################ Pre-Build Database Updation/Creation #################
 # TODO: Is there a better way to create and use the sqlite file rather than directly in the installation?
+import sqlite3 as _sqlite3
 sqlpath = files('osdag.data.ResourceFiles.Database').joinpath('Intg_osdag.sql')
 sqlitepath = files('osdag.data.ResourceFiles.Database').joinpath('Intg_osdag.sqlite')
 
+
+def _build_sqlite(sql_file, sqlite_file):
+    """Crea la base SQLite a partir del volcado .sql con el módulo sqlite3 de Python
+    (no requiere el programa de línea de comandos sqlite3)."""
+    tmp = Path(str(sqlite_file) + '.tmp')
+    if tmp.exists():
+        tmp.unlink()
+    conn = _sqlite3.connect(str(tmp))
+    try:
+        conn.executescript(Path(str(sql_file)).read_text(encoding='utf-8', errors='ignore'))
+        conn.commit()
+    finally:
+        conn.close()
+    os.replace(str(tmp), str(sqlite_file))
+
+
 if sqlpath.exists():
     if not sqlitepath.exists():
-        cmd = 'sqlite3 ' + str(sqlitepath) + ' < ' + str(sqlpath)
-        os.system(cmd)
+        _build_sqlite(sqlpath, sqlitepath)
         sqlpath.touch()
         print('Database Created')
 
     elif sqlitepath.stat().st_size == 0 or sqlitepath.stat().st_mtime < sqlpath.stat().st_mtime - 1:
         try:
-            sqlitenewpath = files('osdag.data.ResourceFiles.Database').joinpath('Intg_osdag_new.sqlite')
-            cmd = 'sqlite3 ' + str(sqlitenewpath) + ' < ' + str(sqlpath)
-            error = os.system(cmd)
-            print(error)
-            # if error != 0:
-            #      raise Exception('SQL to SQLite conversion error 1')
-            # if sqlitenewpath.stat().st_size == 0:
-            #      raise Exception('SQL to SQLite conversion error 2')
-            os.remove(sqlitepath)
-            sqlitenewpath.rename(sqlitepath)
+            _build_sqlite(sqlpath, sqlitepath)
             sqlpath.touch()
             print('Database Updated', sqlpath.stat().st_mtime, sqlitepath.stat().st_mtime)
         except Exception as e:
-            sqlitenewpath.unlink()
             print('Error: ', e)
 #########################################################################################
 
@@ -170,6 +176,7 @@ from .design_type.flexural_member.flexure_othersupp import Flexure_Misc
 # from .design_type.plate_girder.weldedPlateGirder import PlateGirderWelded
 # from .cad.cad_common import call_3DBeam
 from .APP_CRASH.Appcrash import api as appcrash
+from .gui.aisc_ventana import AISCMemberWindow, AISCConnectionWindow
 import configparser
 import os.path
 import subprocess
@@ -261,6 +268,11 @@ class OsdagMainWindow(QMainWindow):
         self.ui.myStackedWidget.currentChanged.connect(self.current_changed)
         self.Under_Development='UNDER DEVELOPMENT'
         self.Modules={
+                'AISC 360-22' : [
+                            ('Verificación de miembros', str(files("osdag.data.ResourceFiles.images").joinpath("simply-supported-beam.jpg")), 'AISC_Member'),
+                            ('Verificación de conexiones', str(files("osdag.data.ResourceFiles.images").joinpath("finplate.png")), 'AISC_Connection'),
+                            self.show_aisc_module,
+                                   ],
                 'Connection' : {
                                 'Shear Connection' : [
                                     ('Fin Plate',str(files("osdag.data.ResourceFiles.images").joinpath("finplate.png")),'Fin_Plate'),
@@ -712,6 +724,20 @@ class OsdagMainWindow(QMainWindow):
             self.ui2.show()
             self.ui2.closed.connect(self.show)
 
+    def show_aisc_module(self):
+        """Abre las ventanas de verificación según AISC 360-22."""
+        if self.findChild(QRadioButton, 'AISC_Member').isChecked():
+            window = AISCMemberWindow()
+        elif self.findChild(QRadioButton, 'AISC_Connection').isChecked():
+            window = AISCConnectionWindow()
+        else:
+            QMessageBox.about(self, "INFO", "Please select appropriate connection")
+            return
+        self.hide()
+        self.ui2 = window
+        self.ui2.show()
+        self.ui2.closed.connect(self.show)
+
     def show_flexure_module(self):
         """ Create radio buttons for the sub-modules under the compression module"""
         # print(f"Here8")
@@ -922,6 +948,10 @@ def do_stuff():
     file.open(QFile.ReadOnly | QFile.Text)
     stream = QTextStream(file)
     app = QApplication(sys.argv)
+    from .gui.qt_compat import apply_safe_font
+    apply_safe_font(app)
+    from . import i18n
+    i18n.install(app)
     app.setStyleSheet(stream.readAll())
     app.setStyle('Fusion')
 

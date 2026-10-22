@@ -589,8 +589,8 @@ class Window(QMainWindow):
                 #l.setFixedSize(l.size())
                 in_layout2.addWidget(l, j, 1, 1, 1)
                 metrices = QtGui.QFontMetrics(font)
-                if type not in [TYPE_TEXTBOX, '']:
-                    maxi_width_left = max(maxi_width_left, metrices.boundingRect(lable).width() + 8)
+                # Ancho medido con la fuente real de la etiqueta (incluye etiquetas de cuadros de texto)
+                maxi_width_left = max(maxi_width_left, QtGui.QFontMetrics(l.font()).boundingRect(lable).width() + 24)
 
             if type == TYPE_COMBOBOX or type == TYPE_COMBOBOX_CUSTOMIZED:
                 combo = QtWidgets.QComboBox(self.dockWidgetContents)
@@ -620,7 +620,7 @@ class Window(QMainWindow):
                     # else:
                     #     pass
 
-                    item_width = max(item_width, metrices.boundingRect(item).width())
+                    item_width = max(item_width, QtGui.QFontMetrics(combo.font()).boundingRect(item).width())
                 # print(metrices.boundingRect(item).width(), "item 1")
                 # print(len(item),"item")
                 # print(len(max_width),"max")

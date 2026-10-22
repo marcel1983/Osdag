@@ -1,0 +1,13 @@
+aisc_shapes_si.csv
+==================
+
+Catálogo de perfiles AISC (W, M, S, HP, C, MC, L, WT, MT, ST, HSS rectangulares,
+HSS circulares, Pipe y ángulos dobles) convertido a unidades SI (mm, mm², mm³, mm⁴,
+mm⁶, kg/m) con tools/importar_catalogo_aisc.py.
+
+Datos de origen: tablas "shape files" del paquete steelpy 1.1.1
+(https://pypi.org/project/steelpy/, licencia Apache-2.0), derivadas del
+AISC Shapes Database (American Institute of Steel Construction).
+
+Factores de conversión: 1 in = 25.4 mm ; 1 lb/ft = 1.488164 kg/m.
+Para HSS, "tdes" es el espesor de diseño (0.93 tnom en ASTM A500), AISC 360-22 B4.2.

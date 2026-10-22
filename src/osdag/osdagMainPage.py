@@ -176,7 +176,13 @@ from .design_type.flexural_member.flexure_othersupp import Flexure_Misc
 # from .design_type.plate_girder.weldedPlateGirder import PlateGirderWelded
 # from .cad.cad_common import call_3DBeam
 from .APP_CRASH.Appcrash import api as appcrash
-from .gui.aisc_ventana import AISCMemberWindow, AISCConnectionWindow
+from .gui.aisc_ventana import (AISCMemberWindow, AISCConnectionWindow, CONN_SHEAR_TAB, CONN_BOLTED, CONN_WELDED,
+                               CONN_BASE, CONN_DOUBLE_ANGLE, CONN_SHEAR_END_PLATE, CONN_SEATED, CONN_SPLICE,
+                               CONN_MOMENT_END_PLATE, PRESET_COLUMN, PRESET_STRUT, PRESET_BEAM, PRESET_CANTILEVER,
+                               PRESET_BEAM_COLUMN, PRESET_GIRDER, PRESET_TENSION)
+from .gui.selector_norma import CODE_IS, CODE_AISC, ask_code, saved_code
+
+_main_windows = []
 import configparser
 import os.path
 import subprocess
@@ -227,7 +233,8 @@ class Submodule_Widget(QWidget):            # Module Variant widget with a Name,
         Module_Name,Image_Path,Object_Name=Iterative
         layout=QVBoxLayout()
         self.setLayout(layout)
-        label=QLabel(Module_Name)
+        label=QLabel()
+        label.setText(Module_Name)     # setText para que se aplique la traducción
         layout.addWidget(label)
         label.setObjectName('module_name_label')
         self.rdbtn=QRadioButton()
@@ -255,8 +262,9 @@ class LeftPanelButton(QWidget):          # Custom Button widget for the Left Pan
 
 
 class OsdagMainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, code=None):
         super().__init__()
+        self.code = code or CODE_IS
         resolution = QtWidgets.QDesktopWidget().screenGeometry()
         width = resolution.width()
         height = resolution.height()
@@ -268,11 +276,6 @@ class OsdagMainWindow(QMainWindow):
         self.ui.myStackedWidget.currentChanged.connect(self.current_changed)
         self.Under_Development='UNDER DEVELOPMENT'
         self.Modules={
-                'AISC 360-22' : [
-                            ('Verificación de miembros', str(files("osdag.data.ResourceFiles.images").joinpath("simply-supported-beam.jpg")), 'AISC_Member'),
-                            ('Verificación de conexiones', str(files("osdag.data.ResourceFiles.images").joinpath("finplate.png")), 'AISC_Connection'),
-                            self.show_aisc_module,
-                                   ],
                 'Connection' : {
                                 'Shear Connection' : [
                                     ('Fin Plate',str(files("osdag.data.ResourceFiles.images").joinpath("finplate.png")),'Fin_Plate'),
@@ -345,6 +348,10 @@ class OsdagMainWindow(QMainWindow):
                 '3D Frame' : self.Under_Development,
                 'Group Design' : self.Under_Development,
                 }
+        # Módulos según la norma de diseño elegida al iniciar
+        if self.code == CODE_AISC:
+            self.Modules = self.aisc_modules()
+        self.setWindowTitle('Osdag — %s' % self.code)
 
 ####################################### UI Formation ################################
         for ModuleName in self.Modules:                      #Level 1 dictionary handling
@@ -453,9 +460,156 @@ class OsdagMainWindow(QMainWindow):
             else:
                 raise ValueError
 
+        self.add_code_bar()
         self.resize(int(width*(0.85)), int(height*(0.75)))
         self.center()
         self.show()
+
+    # ------------------------------------------------------------------------------------------
+    # Norma de diseño (IS 800:2007 / AISC 360-22)
+    # ------------------------------------------------------------------------------------------
+    def add_code_bar(self):
+        """Indicador de la norma activa y botón para cambiarla (al final del panel izquierdo)."""
+        bar = QWidget()
+        lay = QVBoxLayout(bar)
+        lay.setContentsMargins(0, 12, 0, 0)
+        lbl = QLabel('<b>Norma de diseño:</b> %s' % self.code)
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setObjectName('norma_label')
+        btn = QtWidgets.QPushButton('Cambiar norma de diseño')
+        btn.setObjectName('btn_cambiar_norma')
+        btn.clicked.connect(self.change_code)
+        lay.addWidget(lbl)
+        lay.addWidget(btn)
+        self.ui.verticalLayout.addWidget(bar)
+
+    def change_code(self):
+        code = ask_code(self, self.code)
+        if not code or code == self.code:
+            return
+        new = OsdagMainWindow(code)
+        global _main_windows
+        _main_windows.append(new)
+        self.hide()
+        self.deleteLater()
+
+    def aisc_modules(self):
+        img = lambda n: str(files("osdag.data.ResourceFiles.images").joinpath(n))
+        UD = self.Under_Development
+        return {
+            'Connection': {
+                'Shear Connection': [
+                    ('Fin Plate', img("finplate.png"), 'AISC_Fin_Plate'),
+                    ('Cleat Angle', img("cleatAngle.png"), 'AISC_Cleat_Angle'),
+                    ('End Plate', img("endplate.png"), 'AISC_End_Plate'),
+                    ('Seated Angle', img("seatedAngle1.png"), 'AISC_Seated_Angle'),
+                    self._aisc_handler(['AISC_Fin_Plate', 'AISC_Cleat_Angle', 'AISC_End_Plate', 'AISC_Seated_Angle']),
+                ],
+                'Moment Connection': {
+                    'Beam-to-Beam Splice': [
+                        ('Cover Plate Bolted', img("bbcoverplatebolted.png"), 'AISC_B2B_Cover_Plate'),
+                        ('End Plate', img("bb_splice.png"), 'AISC_B2B_End_Plate'),
+                        self._aisc_handler(['AISC_B2B_Cover_Plate', 'AISC_B2B_End_Plate']),
+                    ],
+                    'Beam-to-Column': [
+                        ('End Plate', img("BC-EBW_GUI.png"), 'AISC_BC_End_Plate'),
+                        self._aisc_handler(['AISC_BC_End_Plate']),
+                    ],
+                    'Column-to-Column Splice': [
+                        ('Cover Plate Bolted', img("cccoverplatebolted.png"), 'AISC_C2C_Cover_Plate'),
+                        self._aisc_handler(['AISC_C2C_Cover_Plate']),
+                    ],
+                    'PEB': UD,
+                },
+                'Base Plate': [
+                    ('Base Plate Connection', img("base_plate.png"), 'AISC_Base_Plate'),
+                    self._aisc_handler(['AISC_Base_Plate']),
+                ],
+                'Truss Connection': UD,
+            },
+            'Tension Member': [
+                ('Bolted to End Gusset', img("bolted_ten.png"), 'AISC_Tension_Bolted'),
+                ('Welded to End Gusset', img("welded_ten.png"), 'AISC_Tension_Welded'),
+                ('Member Check', img("RRRRstrut.png"), 'AISC_Tension_Member'),
+                self._aisc_handler(['AISC_Tension_Bolted', 'AISC_Tension_Welded', 'AISC_Tension_Member']),
+            ],
+            'Compression Member': [
+                ('Columns with known support conditions', img("CompressionMembers_ColumnsInFrames.png"), 'AISC_Column'),
+                ('Struts in Trusses', img("strut.jpg"), 'AISC_Strut'),
+                self._aisc_handler(['AISC_Column', 'AISC_Strut']),
+            ],
+            'Flexural Member': [
+                ('Simply Supported Beam', img("simply-supported-beam.jpg"), 'AISC_Beam_SS'),
+                ('Cantilever Beam', img("cantilever-beam.jpg"), 'AISC_Beam_Cantilever'),
+                self._aisc_handler(['AISC_Beam_SS', 'AISC_Beam_Cantilever']),
+            ],
+            'Beam-Column': [
+                ('Beam-Column', img("BEAM.png"), 'AISC_Beam_Column'),
+                self._aisc_handler(['AISC_Beam_Column']),
+            ],
+            'Plate Girder': [
+                ('Welded Plate Girder', img("Slope_Beam.png"), 'AISC_Plate_Girder'),
+                self._aisc_handler(['AISC_Plate_Girder']),
+            ],
+            'Truss': UD,
+            '2D Frame': UD,
+            '3D Frame': UD,
+            'Group Design': UD,
+        }
+
+    _AISC_CONNECTIONS = {
+        'AISC_Fin_Plate': CONN_SHEAR_TAB, 'AISC_Cleat_Angle': CONN_DOUBLE_ANGLE,
+        'AISC_End_Plate': CONN_SHEAR_END_PLATE, 'AISC_Seated_Angle': CONN_SEATED,
+        'AISC_B2B_Cover_Plate': CONN_SPLICE, 'AISC_B2B_End_Plate': CONN_MOMENT_END_PLATE,
+        'AISC_BC_End_Plate': CONN_MOMENT_END_PLATE, 'AISC_C2C_Cover_Plate': CONN_SPLICE,
+        'AISC_Base_Plate': CONN_BASE, 'AISC_Tension_Bolted': CONN_BOLTED, 'AISC_Tension_Welded': CONN_WELDED,
+    }
+    _AISC_MEMBERS = {
+        'AISC_Column': PRESET_COLUMN, 'AISC_Strut': PRESET_STRUT, 'AISC_Beam_SS': PRESET_BEAM,
+        'AISC_Beam_Cantilever': PRESET_CANTILEVER, 'AISC_Beam_Column': PRESET_BEAM_COLUMN,
+        'AISC_Plate_Girder': PRESET_GIRDER, 'AISC_Tension_Member': PRESET_TENSION,
+    }
+
+    def _checked(self, names):
+        for name in names:
+            rb = self.findChild(QRadioButton, name)
+            if rb is not None and rb.isChecked():
+                return name
+        return None
+
+    def _open(self, window):
+        self.hide()
+        self.ui2 = window
+        self.ui2.show()
+        self.ui2.closed.connect(self.show)
+
+    def _aisc_handler(self, names):
+        """Manejador del botón «Iniciar» de una página: solo considera las opciones de esa página."""
+        return lambda: self.open_aisc(names)
+
+    def open_aisc(self, names):
+        name = self._checked(names)
+        if name is None:
+            QMessageBox.about(self, "INFO", "Please select appropriate connection")
+            return
+        if name in self._AISC_MEMBERS:
+            return self._open(AISCMemberWindow(preset=self._AISC_MEMBERS[name]))
+        w = AISCConnectionWindow(initial=self._AISC_CONNECTIONS[name])
+        if name == 'AISC_BC_End_Plate':
+            w.me_where.setCurrentIndex(1)
+        elif name == 'AISC_C2C_Cover_Plate':
+            w.sp_kind.setCurrentText('Columna')
+            i = w.sp_mem.designation.findText('W14X90')
+            if i >= 0:
+                w.sp_mem.designation.setCurrentIndex(i)
+            w.sp_Pt.setCurrentText('Compresión')
+            w.sp_P.setValue(1000)
+            w.sp_M.setValue(100)
+            w.sp_fpb.setValue(350)
+            w.sp_fg.setValue(250)
+            w.sp_nfr.setValue(5)
+            w.sp_wph.setValue(250)
+        self._open(w)
 
     def center(self):
         frameGm = self.frameGeometry()
@@ -467,7 +621,9 @@ class OsdagMainWindow(QMainWindow):
     @pyqtSlot(int)
     def current_changed(self, index):
         l = list(self.Modules.keys())
-        items = list(self.ui.verticalLayout.itemAt(i) for i in range(self.ui.verticalLayout.count()))
+        items = [self.ui.verticalLayout.itemAt(i) for i in range(self.ui.verticalLayout.count())]
+        # Solo los botones de módulo (se excluye la barra de norma de diseño)
+        items = [it for it in items if it.widget() is not None and hasattr(it.widget(), 'ui')]
         # print(items,"hfhh")
         for item in range(len(items)):
             if item == index-1:
@@ -724,20 +880,6 @@ class OsdagMainWindow(QMainWindow):
             self.ui2.show()
             self.ui2.closed.connect(self.show)
 
-    def show_aisc_module(self):
-        """Abre las ventanas de verificación según AISC 360-22."""
-        if self.findChild(QRadioButton, 'AISC_Member').isChecked():
-            window = AISCMemberWindow()
-        elif self.findChild(QRadioButton, 'AISC_Connection').isChecked():
-            window = AISCConnectionWindow()
-        else:
-            QMessageBox.about(self, "INFO", "Please select appropriate connection")
-            return
-        self.hide()
-        self.ui2 = window
-        self.ui2.show()
-        self.ui2.closed.connect(self.show)
-
     def show_flexure_module(self):
         """ Create radio buttons for the sub-modules under the compression module"""
         # print(f"Here8")
@@ -956,7 +1098,12 @@ def do_stuff():
     app.setStyle('Fusion')
 
     # path = os.path.join(os.path.dirname(__file__), 'ResourceFiles', 'images', 'Osdag.png')
-    window = OsdagMainWindow()
+    # Norma de diseño: la guardada (si se marcó «Recordar») o la que elija el usuario
+    code = saved_code() or ask_code()
+    if not code:
+        sys.exit(0)
+    window = OsdagMainWindow(code)
+    _main_windows.append(window)
     # print("Here0")
 
     # trayIcon = SystemTrayIcon(QtGui.QIcon(path), window)

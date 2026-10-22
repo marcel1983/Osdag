@@ -10,6 +10,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, pyqtSignal
 
 from ..aisc import secciones as S
+from ..aisc import catalogo as K
 from ..aisc.base import LRFD, ASD
 from ..aisc.materiales import ACEROS, PERNOS, ELECTRODOS, BOLT_DIAMETERS, HOLE_TYPES
 from ..aisc.miembros import MemberInput, check_member
@@ -17,8 +18,10 @@ from ..aisc import conexiones as C
 from ..aisc.reporte import build_report
 
 CUSTOM = 'Personalizado'
-FROM_DB = 'Base de datos Osdag'
-FROM_DIMS = 'Dimensiones'
+FROM_AISC = 'Catálogo AISC'
+FROM_DB = 'Base de datos Osdag (IS 808)'
+FROM_DIMS = 'Dimensiones (perfil armado)'
+ORIGINS = [FROM_AISC, FROM_DB, FROM_DIMS]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -141,7 +144,7 @@ def lay_add(lay, label, w):
 
 
 class SectionPicker(QtWidgets.QWidget):
-    """Selector de sección: base de datos de Osdag o dimensiones."""
+    """Selector de sección: catálogo AISC, base de datos de Osdag (IS 808) o dimensiones."""
     changed = pyqtSignal()
 
     DIMS = {
@@ -154,10 +157,12 @@ class SectionPicker(QtWidgets.QWidget):
         S.ROUND_HSS: [('D', 'Diámetro exterior D', 168.3), ('t', 'Espesor nominal t', 6.4)],
     }
 
-    PREFERRED = {S.I_SHAPE: ['HB 300', 'MB 450'], S.CHANNEL: ['MC 300'], S.ANGLE: ['100 x 100 x 10'],
-                 S.RECT_HSS: ['SHS 150 x 150 x 6.0', 'SHS 150 x 150 x 5.0'], S.ROUND_HSS: ['CHS 168.3 x 6.3']}
+    PREFERRED = {S.I_SHAPE: ['W14X90', 'HB 300', 'MB 450'], S.CHANNEL: ['C12X30', 'MC 300'],
+                 S.ANGLE: ['L4X4X1/2', '100 x 100 x 10'],
+                 S.RECT_HSS: ['HSS8X8X1/2', 'SHS 150 x 150 x 6.0', 'SHS 150 x 150 x 5.0'],
+                 S.ROUND_HSS: ['HSS6.625X0.280', 'CHS 168.3 x 6.3']}
 
-    def __init__(self, prefix, kinds=None, default_kind=S.I_SHAPE, preferred=None):
+    def __init__(self, prefix, kinds=None, default_kind=S.I_SHAPE, preferred=None, origins=None):
         super().__init__()
         self.prefix = prefix
         self.preferred = dict(self.PREFERRED)
@@ -168,7 +173,7 @@ class SectionPicker(QtWidgets.QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         self.kind = lay_add(lay, 'Tipo de sección', combo(prefix + '_tipo', kinds, default_kind))
         self.kind.setEnabled(len(kinds) > 1)
-        self.origin = lay_add(lay, 'Origen', combo(prefix + '_origen', [FROM_DB, FROM_DIMS]))
+        self.origin = lay_add(lay, 'Catálogo', combo(prefix + '_origen', origins or ORIGINS))
         self.designation = lay_add(lay, 'Designación', combo(prefix + '_designacion', [], editable=True))
         self.built_up = lay_add(lay, '', check(prefix + '_armado', 'Perfil soldado / armado (no laminado)'))
         self.erw = lay_add(lay, '', check(prefix + '_erw', 'HSS ERW ASTM A500: t diseño = 0.93 t nominal (B4.2)'))
@@ -185,20 +190,27 @@ class SectionPicker(QtWidgets.QWidget):
                 fields[key].valueChanged.connect(self.changed)
             self.dim_fields[k] = fields
             self.stack.addWidget(page)
-        self.kind.currentTextChanged.connect(self._kind_changed)
-        self.origin.currentTextChanged.connect(self._origin_changed)
+        self.kind.currentTextChanged.connect(self._reload)
+        self.origin.currentTextChanged.connect(self._reload)
         self.designation.currentTextChanged.connect(self.changed)
         self.built_up.toggled.connect(self.changed)
         self.erw.toggled.connect(self.changed)
-        self._kind_changed()
+        self._reload()
 
-    def _kind_changed(self, *_):
+    def _catalog(self):
+        return self.origin.currentText() in (FROM_AISC, FROM_DB)
+
+    def _reload(self, *_):
         k = self.kind.currentText()
         self.stack.setCurrentIndex(S.SHAPE_TYPES.index(k))
         self.designation.blockSignals(True)
         self.designation.clear()
+        names = []
         try:
-            names = S.list_designations(k)
+            if self.origin.currentText() == FROM_AISC:
+                names = K.list_designations(k)
+            elif self.origin.currentText() == FROM_DB:
+                names = S.list_designations(k)
         except Exception:
             names = []
         self.designation.addItems(names)
@@ -208,24 +220,28 @@ class SectionPicker(QtWidgets.QWidget):
                 self.designation.setCurrentIndex(norm[pref])
                 break
         self.designation.blockSignals(False)
+        cat = self._catalog() and self.designation.count() > 0
+        self.designation.setEnabled(cat)
+        self.stack.setVisible(not cat)
         self.built_up.setVisible(k == S.I_SHAPE)
-        self.erw.setVisible(k in (S.RECT_HSS, S.ROUND_HSS))
-        self._origin_changed()
-
-    def _origin_changed(self, *_):
-        db = self.origin.currentText() == FROM_DB and self.designation.count() > 0
-        self.designation.setEnabled(db)
-        self.stack.setVisible(not db)
-        self.built_up.setEnabled(not db)
+        self.built_up.setEnabled(not cat)
+        # En el catálogo AISC el espesor de diseño de los HSS ya está tabulado (tdes)
+        self.erw.setVisible(k in (S.RECT_HSS, S.ROUND_HSS) and self.origin.currentText() != FROM_AISC)
         self.changed.emit()
 
     def section(self):
         k = self.kind.currentText()
         erw = self.erw.isChecked()
-        if self.origin.currentText() == FROM_DB and self.designation.count() > 0:
-            s = S.from_database(k, self.designation.currentText(), erw)
+        name = self.designation.currentText()
+        if self.origin.currentText() == FROM_AISC and self.designation.count() > 0:
+            s = K.from_catalog(name)
             if s is None:
-                raise ValueError('No se encontró «%s» en la base de datos.' % self.designation.currentText())
+                raise ValueError('No se encontró «%s» en el catálogo AISC.' % name)
+            return s
+        if self.origin.currentText() == FROM_DB and self.designation.count() > 0:
+            s = S.from_database(k, name, erw)
+            if s is None:
+                raise ValueError('No se encontró «%s» en la base de datos.' % name)
             return s
         f = {key: w.value() for key, w in self.dim_fields[k].items()}
         if k == S.I_SHAPE:
@@ -239,14 +255,14 @@ class SectionPicker(QtWidgets.QWidget):
         return S.RoundHSS.from_dims(f['D'], f['t'], erw)
 
     def describe(self):
-        rows = [('Tipo de sección', self.kind.currentText(), '')]
-        if self.origin.currentText() == FROM_DB and self.designation.count() > 0:
+        rows = [('Tipo de sección', self.kind.currentText(), ''), ('Catálogo', self.origin.currentText(), '')]
+        if self._catalog() and self.designation.count() > 0:
             rows.append(('Designación', self.designation.currentText(), ''))
         else:
             k = self.kind.currentText()
             for key, label, _ in self.DIMS[k]:
                 rows.append((label, self.dim_fields[k][key].value(), 'mm'))
-        if self.kind.currentText() in (S.RECT_HSS, S.ROUND_HSS):
+        if self.kind.currentText() in (S.RECT_HSS, S.ROUND_HSS) and self.origin.currentText() != FROM_AISC:
             rows.append(('HSS ERW A500 (0.93t)', 'Sí' if self.erw.isChecked() else 'No', ''))
         return rows
 
@@ -329,8 +345,7 @@ class AISCWindowBase(QtWidgets.QMainWindow):
         self.status.setStyleSheet('font-size: 13pt; padding: 6px;')
         rl.addWidget(self.status)
         self.tabs = QtWidgets.QTabWidget()
-        self.table = self._make_table(['Verificación', 'Cláusula', 'Demanda', 'Resistencia disponible', 'Relación',
-                                       'Estado'])
+        self.table = self._make_table(['Verificación', 'Cláusula', 'Demanda', 'Resistencia', 'D/C', 'Estado'])
         self.limits_table = self._make_table(['Requisito', 'Referencia', 'Valor', 'Límite', 'Estado'])
         self.props_table = self._make_table(['Propiedad', 'Valor', 'Unidad'])
         self.detail = QtWidgets.QTextBrowser()
@@ -379,9 +394,11 @@ class AISCWindowBase(QtWidgets.QMainWindow):
         t.setAlternatingRowColors(True)
         t.setWordWrap(True)
         t.setTextElideMode(Qt.ElideNone)
-        t.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        hh = t.horizontalHeader()
+        hh.setMinimumSectionSize(50)
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         for i in range(1, len(headers)):
-            t.horizontalHeader().setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
+            hh.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
         return t
 
     def add_group(self, title):
@@ -405,6 +422,8 @@ class AISCWindowBase(QtWidgets.QMainWindow):
                     it.setFont(f)
                 if j > 0:
                     it.setTextAlignment(Qt.AlignCenter)
+                if j == 1 and isinstance(val, str):
+                    it.setText(val.replace(', ', '\n').replace(' / ', '\n'))
                 it.setToolTip(str(val))
                 table.setItem(i, j, it)
         table.resizeRowsToContents()
@@ -563,8 +582,84 @@ class AISCWindowBase(QtWidgets.QMainWindow):
 # ---------------------------------------------------------------------------------------------
 # Miembros
 # ---------------------------------------------------------------------------------------------
+PRESET_COLUMN = 'columna'
+PRESET_STRUT = 'puntal'
+PRESET_BEAM = 'viga'
+PRESET_CANTILEVER = 'voladizo'
+PRESET_BEAM_COLUMN = 'viga_columna'
+PRESET_GIRDER = 'viga_armada'
+PRESET_TENSION = 'traccion'
+
+_PRESET_TITLES = {
+    PRESET_COLUMN: 'Columna a compresión (AISC 360-22, Cap. E)',
+    PRESET_STRUT: 'Puntal de armadura - ángulo (AISC 360-22, E5)',
+    PRESET_BEAM: 'Viga simplemente apoyada (AISC 360-22, Caps. F y G)',
+    PRESET_CANTILEVER: 'Viga en voladizo (AISC 360-22, Caps. F y G)',
+    PRESET_BEAM_COLUMN: 'Viga-columna (AISC 360-22, Cap. H)',
+    PRESET_GIRDER: 'Viga armada soldada (AISC 360-22, F4/F5 y G2)',
+    PRESET_TENSION: 'Miembro a tracción (AISC 360-22, Cap. D)',
+}
+
+
 class AISCMemberWindow(AISCWindowBase):
     TITLE = 'Verificación de miembros AISC 360-22'
+
+    def __init__(self, parent=None, preset=None):
+        if preset in _PRESET_TITLES:
+            self.TITLE = _PRESET_TITLES[preset]
+        super().__init__(parent)
+        if preset:
+            self.apply_preset(preset)
+
+    def apply_preset(self, preset):
+        """Valores iniciales según el submódulo de Osdag desde el que se abre la ventana."""
+        sec, k = self.sec, None
+        vals = {}
+        if preset == PRESET_COLUMN:
+            k, des = S.I_SHAPE, 'W14X90'
+            vals = dict(ptype='Compresión', P=1500, Mx=0, My=0, Vy=0, Vx=0, Lx=4, Ly=4, Lz=4, Lb=4)
+        elif preset == PRESET_STRUT:
+            k, des = S.ANGLE, 'L4X4X1/2'
+            vals = dict(ptype='Compresión', P=150, Mx=0, My=0, Vy=0, Vx=0, Lx=2.5, Ly=2.5, Lz=2.5, Lb=2.5)
+            self.E5.setChecked(True)
+        elif preset == PRESET_TENSION:
+            k, des = S.ANGLE, 'L4X4X1/2'
+            vals = dict(ptype='Tracción', P=300, Mx=0, My=0, Vy=0, Vx=0, Lx=3, Ly=3, Lz=3, Lb=3)
+            self.U.setValue(0.80)
+        elif preset == PRESET_BEAM:
+            k, des = S.I_SHAPE, 'W18X50'
+            vals = dict(ptype='Compresión', P=0, Mx=200, My=0, Vy=120, Vx=0, Lx=8, Ly=2.5, Lz=2.5, Lb=2.5, Cb=1.0)
+        elif preset == PRESET_CANTILEVER:
+            k, des = S.I_SHAPE, 'W18X50'
+            vals = dict(ptype='Compresión', P=0, Mx=120, My=0, Vy=60, Vx=0, Lx=3, Ly=3, Lz=3, Lb=3, Cb=1.0, Ky=2.0,
+                        Kx=2.0)
+            self.status.setText('Voladizo: use Lb = longitud del voladizo y Cb = 1.0 (comentario F1, AISC 360-22).')
+        elif preset == PRESET_BEAM_COLUMN:
+            k, des = S.I_SHAPE, 'W14X90'
+            vals = dict(ptype='Compresión', P=900, Mx=200, My=30, Vy=80, Vx=10, Lx=4.5, Ly=4.5, Lz=4.5, Lb=4.5)
+        elif preset == PRESET_GIRDER:
+            k, des = S.I_SHAPE, None
+            sec.origin.setCurrentText(FROM_DIMS)
+            sec.built_up.setChecked(True)
+            for key, v in dict(d=1500, bf=450, tf=30, tw=12, r=0).items():
+                sec.dim_fields[S.I_SHAPE][key].setValue(v)
+            self.a.setValue(1500)
+            self.mat.grade.setCurrentText('ASTM A572 Gr. 50')
+            vals = dict(ptype='Compresión', P=0, Mx=4500, My=0, Vy=1500, Vx=0, Lx=20, Ly=5, Lz=5, Lb=5)
+        if k:
+            sec.kind.setCurrentText(k)
+            if des:
+                i = sec.designation.findText(des)
+                if i >= 0:
+                    sec.designation.setCurrentIndex(i)
+        fields = dict(ptype=self.ptype, P=self.P, Mx=self.Mx, My=self.My, Vy=self.Vy, Vx=self.Vx, Lx=self.Lx,
+                      Ly=self.Ly, Lz=self.Lz, Lb=self.Lb, Cb=self.Cb, Kx=self.Kx, Ky=self.Ky)
+        for name, v in vals.items():
+            w = fields[name]
+            if isinstance(w, QtWidgets.QComboBox):
+                w.setCurrentText(v)
+            else:
+                w.setValue(v)
 
     def build_form(self):
         g = self.add_group('Método de diseño y material')
@@ -649,7 +744,13 @@ CONN_SHEAR_TAB = 'Placa simple de cortante (viga)'
 CONN_BOLTED = 'Miembro atornillado a cartela'
 CONN_WELDED = 'Miembro soldado a cartela'
 CONN_BASE = 'Placa base de columna (compresión axial)'
-CONN_TYPES = [CONN_SHEAR_TAB, CONN_BOLTED, CONN_WELDED, CONN_BASE]
+CONN_DOUBLE_ANGLE = 'Ángulos dobles de cortante (viga)'
+CONN_SHEAR_END_PLATE = 'Placa de extremo a cortante (viga)'
+CONN_SEATED = 'Ángulo de asiento no rigidizado (viga)'
+CONN_SPLICE = 'Empalme con cubreplacas atornilladas (viga o columna)'
+CONN_MOMENT_END_PLATE = 'Placa de extremo a momento (DG16)'
+CONN_TYPES = [CONN_SHEAR_TAB, CONN_BOLTED, CONN_WELDED, CONN_BASE, CONN_DOUBLE_ANGLE, CONN_SHEAR_END_PLATE,
+              CONN_SEATED, CONN_SPLICE, CONN_MOMENT_END_PLATE]
 
 
 class AISCConnectionWindow(AISCWindowBase):
@@ -659,6 +760,11 @@ class AISCConnectionWindow(AISCWindowBase):
         super().__init__(parent)
         if initial in CONN_TYPES:
             self.ctype.setCurrentText(initial)
+        self.ctype.currentTextChanged.connect(self._retitle)
+        self._retitle()
+
+    def _retitle(self, *_):
+        self.setWindowTitle('Osdag — %s (AISC 360-22)' % self.ctype.currentText())
 
     def build_form(self):
         g = self.add_group('Tipo de conexión y método')
@@ -666,11 +772,25 @@ class AISCConnectionWindow(AISCWindowBase):
         self.method = g.add('Método', combo('metodo', [LRFD, ASD]))
         self.pages = QtWidgets.QStackedWidget()
         self.form_layout.addWidget(self.pages)
-        self.ctype.currentIndexChanged.connect(self.pages.setCurrentIndex)
+        self.ctype.currentIndexChanged.connect(self._show_page)
         self._page_shear_tab()
         self._page_bolted()
         self._page_welded()
         self._page_base()
+        self._page_double_angle()
+        self._page_shear_end_plate()
+        self._page_seated()
+        self._page_splice()
+        self._page_moment_end_plate()
+        self._show_page(0)
+
+    def _show_page(self, index):
+        # Solo la página visible define la altura del QStackedWidget
+        for i in range(self.pages.count()):
+            pol = QtWidgets.QSizePolicy.Preferred if i == index else QtWidgets.QSizePolicy.Ignored
+            self.pages.widget(i).setSizePolicy(pol, pol)
+        self.pages.setCurrentIndex(index)
+        self.pages.adjustSize()
 
     def _new_page(self):
         page = QtWidgets.QWidget()
@@ -688,7 +808,7 @@ class AISCConnectionWindow(AISCWindowBase):
     def _page_shear_tab(self):
         group = self._new_page()
         g = group('Viga soportada')
-        self.st_beam = g.add('', SectionPicker('st_viga', [S.I_SHAPE], preferred='MB 450'))
+        self.st_beam = g.add('', SectionPicker('st_viga', [S.I_SHAPE], preferred='W18X50'))
         self.st_beam_mat = g.add('', MaterialPicker('st_vmat', 'ASTM A992'))
         g = group('Placa')
         self.st_tp = g.add('Espesor tp', num('st_tp', 10, 1, 100, 1, 'mm'))
@@ -792,7 +912,249 @@ class AISCConnectionWindow(AISCWindowBase):
         g = group('Solicitación')
         self.bp_P = g.add('Compresión requerida P', num('bp_P', 1500, 0, 1e6, 2, 'kN', 50))
 
+    # 5. Ángulos dobles de cortante
+    def _page_double_angle(self):
+        group = self._new_page()
+        g = group('Viga soportada')
+        self.da_beam = g.add('', SectionPicker('da_viga', [S.I_SHAPE], preferred='W18X50'))
+        self.da_beam_mat = g.add('', MaterialPicker('da_vmat', 'ASTM A992'))
+        g = group('Ángulos de conexión (2)')
+        self.da_angle = g.add('', SectionPicker('da_ang', [S.ANGLE], S.ANGLE, preferred='L4X3-1/2X3/8'))
+        self.da_amat = g.add('', MaterialPicker('da_amat', 'ASTM A36'))
+        g = group('Pernos')
+        self.da_bolt = g.add('', BoltPicker('da_perno'))
+        self.da_n = g.add('Filas de pernos n', integer('da_n', 3, 1, 20))
+        self.da_s = g.add('Paso vertical s', num('da_s', 76, 10, 500, 1, 'mm'))
+        self.da_Lev = g.add('Distancia vertical al borde Lev', num('da_Lev', 32, 5, 300, 1, 'mm'))
+        self.da_Lehb = g.add('Borde horizontal, ala lado viga', num('da_Lehb', 32, 5, 300, 1, 'mm'))
+        self.da_Lehs = g.add('Borde horizontal, ala lado apoyo', num('da_Lehs', 32, 5, 300, 1, 'mm'))
+        self.da_Lehbeam = g.add('Distancia al extremo de la viga', num('da_Lehbeam', 38, 5, 300, 1, 'mm'))
+        self.da_e = g.add('Excentricidad lado viga (0 = ignorar)', num('da_e', 0, 0, 500, 1, 'mm'))
+        g = group('Apoyo')
+        self.da_tsup = g.add('Espesor del apoyo (0 = no verificar)', num('da_tsup', 0, 0, 100, 1, 'mm'))
+        self.da_Fusup = g.add('Fu del apoyo', num('da_Fusup', 450, 0, 1500, 0, 'MPa'))
+        g = group('Solicitación')
+        self.da_V = g.add('Cortante requerido V', num('da_V', 150, 0, 1e5, 2, 'kN', 10))
+
+    # 6. Placa de extremo a cortante
+    def _page_shear_end_plate(self):
+        group = self._new_page()
+        g = group('Viga soportada')
+        self.se_beam = g.add('', SectionPicker('se_viga', [S.I_SHAPE], preferred='W18X50'))
+        self.se_beam_mat = g.add('', MaterialPicker('se_vmat', 'ASTM A992'))
+        g = group('Placa de extremo')
+        self.se_tp = g.add('Espesor tp', num('se_tp', 8, 1, 100, 1, 'mm'))
+        self.se_bp = g.add('Ancho bp', num('se_bp', 200, 50, 1000, 0, 'mm'))
+        self.se_pmat = g.add('', MaterialPicker('se_pmat', 'ASTM A36'))
+        g = group('Pernos')
+        self.se_bolt = g.add('', BoltPicker('se_perno'))
+        self.se_n = g.add('Filas de pernos n', integer('se_n', 3, 1, 20))
+        self.se_s = g.add('Paso vertical s', num('se_s', 76, 10, 500, 1, 'mm'))
+        self.se_Lev = g.add('Distancia vertical al borde Lev', num('se_Lev', 32, 5, 300, 1, 'mm'))
+        self.se_g = g.add('Gramil entre líneas g', num('se_g', 140, 20, 1000, 0, 'mm'))
+        g = group('Soldadura alma-placa y apoyo')
+        self.se_w = g.add('Tamaño w', num('se_w', 6, 1, 50, 1, 'mm'))
+        self.se_E = g.add('Electrodo', combo('se_elec', list(ELECTRODOS.keys()), 'E70XX'))
+        self.se_tsup = g.add('Espesor del apoyo (0 = no verificar)', num('se_tsup', 0, 0, 100, 1, 'mm'))
+        self.se_Fusup = g.add('Fu del apoyo', num('se_Fusup', 450, 0, 1500, 0, 'MPa'))
+        g = group('Solicitación')
+        self.se_V = g.add('Cortante requerido V', num('se_V', 150, 0, 1e5, 2, 'kN', 10))
+
+    # 7. Ángulo de asiento
+    def _page_seated(self):
+        group = self._new_page()
+        g = group('Viga soportada')
+        self.sa_beam = g.add('', SectionPicker('sa_viga', [S.I_SHAPE], preferred='W16X26'))
+        self.sa_beam_mat = g.add('', MaterialPicker('sa_vmat', 'ASTM A992'))
+        g = group('Ángulo de asiento')
+        self.sa_angle = g.add('', SectionPicker('sa_ang', [S.ANGLE], S.ANGLE, preferred='L6X4X5/8'))
+        self.sa_amat = g.add('', MaterialPicker('sa_amat', 'ASTM A36'))
+        self.sa_len = g.add('Longitud del ángulo', num('sa_len', 200, 20, 2000, 0, 'mm'))
+        self.sa_setback = g.add('Holgura viga-apoyo', num('sa_setback', 19, 0, 100, 1, 'mm'))
+        self.sa_short = g.add('', check('sa_corta', 'Ala corta saliente (ala larga contra el apoyo)', True))
+        g = group('Pernos en el apoyo')
+        self.sa_bolt = g.add('', BoltPicker('sa_perno'))
+        self.sa_nb = g.add('Número de pernos', integer('sa_nb', 2, 1, 20))
+        self.sa_tsup = g.add('Espesor del apoyo (0 = no verificar)', num('sa_tsup', 0, 0, 100, 1, 'mm'))
+        self.sa_Fusup = g.add('Fu del apoyo', num('sa_Fusup', 450, 0, 1500, 0, 'MPa'))
+        g = group('Solicitación')
+        self.sa_V = g.add('Reacción requerida V', num('sa_V', 100, 0, 1e5, 2, 'kN', 10))
+
+    # 8. Empalme con cubreplacas atornilladas
+    def _page_splice(self):
+        group = self._new_page()
+        g = group('Miembro empalmado')
+        self.sp_kind = g.add('Tipo', combo('sp_tipo', ['Viga', 'Columna']))
+        self.sp_mem = g.add('', SectionPicker('sp_mem', [S.I_SHAPE], preferred='W18X50'))
+        self.sp_mat = g.add('', MaterialPicker('sp_mmat', 'ASTM A992'))
+        g = group('Cubreplacas')
+        self.sp_fpb = g.add('Ancho de placa de ala', num('sp_fpb', 190, 20, 2000, 0, 'mm'))
+        self.sp_fpt = g.add('Espesor de placa de ala', num('sp_fpt', 16, 1, 100, 1, 'mm'))
+        self.sp_wph = g.add('Altura de placas de alma', num('sp_wph', 300, 20, 3000, 0, 'mm'))
+        self.sp_wpt = g.add('Espesor de placas de alma', num('sp_wpt', 8, 1, 100, 1, 'mm'))
+        self.sp_pmat = g.add('', MaterialPicker('sp_pmat', 'ASTM A572 Gr. 50'))
+        self.sp_gap = g.add('Holgura entre miembros', num('sp_gap', 10, 0, 100, 1, 'mm'))
+        g = group('Pernos de ala')
+        self.sp_fbolt = g.add('', BoltPicker('sp_fperno'))
+        self.sp_nfr = g.add('Filas por lado del empalme', integer('sp_nfr', 3, 1, 30))
+        self.sp_nfl = g.add('Líneas a lo ancho', integer('sp_nfl', 2, 1, 6))
+        self.sp_fs = g.add('Paso', num('sp_fs', 75, 10, 500, 1, 'mm'))
+        self.sp_fe = g.add('Distancia al extremo', num('sp_fe', 40, 5, 300, 1, 'mm'))
+        self.sp_fg = g.add('Gramil entre líneas', num('sp_fg', 100, 10, 1000, 1, 'mm'))
+        g = group('Pernos de alma')
+        self.sp_wbolt = g.add('', BoltPicker('sp_wperno'))
+        self.sp_nwr = g.add('Filas', integer('sp_nwr', 3, 1, 30))
+        self.sp_nwc = g.add('Columnas por lado', integer('sp_nwc', 2, 1, 6))
+        self.sp_ws = g.add('Paso vertical', num('sp_ws', 75, 10, 500, 1, 'mm'))
+        self.sp_wg = g.add('Gramil horizontal', num('sp_wg', 75, 10, 500, 1, 'mm'))
+        self.sp_we = g.add('Distancia al extremo', num('sp_we', 40, 5, 300, 1, 'mm'))
+        g = group('Solicitaciones requeridas')
+        self.sp_M = g.add('Momento M', num('sp_M', 150, 0, 1e5, 2, 'kN·m', 10))
+        self.sp_V = g.add('Cortante V', num('sp_V', 100, 0, 1e5, 2, 'kN', 10))
+        self.sp_Pt = g.add('Tipo de fuerza axial', combo('sp_Pt', ['Compresión', 'Tracción']))
+        self.sp_P = g.add('Fuerza axial P', num('sp_P', 0, 0, 1e5, 2, 'kN', 10))
+
+    # 9. Placa de extremo a momento
+    def _page_moment_end_plate(self):
+        group = self._new_page()
+        g = group('Configuración')
+        self.me_where = g.add('Conexión', combo('me_donde', ['Empalme viga-viga', 'Viga-columna (ala de la columna)']))
+        self.me_cfg = g.add('Placa', combo('me_cfg', [C.ENDPLATE_4E, C.ENDPLATE_FLUSH]))
+        g = group('Viga')
+        self.me_beam = g.add('', SectionPicker('me_viga', [S.I_SHAPE], preferred='W18X50'))
+        self.me_beam_mat = g.add('', MaterialPicker('me_vmat', 'ASTM A992'))
+        g = group('Columna (solo viga-columna)')
+        self.me_col = g.add('', SectionPicker('me_col', [S.I_SHAPE], preferred='W14X90'))
+        self.me_col_mat = g.add('', MaterialPicker('me_cmat', 'ASTM A992'))
+        g = group('Placa de extremo')
+        self.me_bp = g.add('Ancho bp', num('me_bp', 200, 50, 1000, 0, 'mm'))
+        self.me_tp = g.add('Espesor tp', num('me_tp', 20, 1, 100, 1, 'mm'))
+        self.me_pmat = g.add('', MaterialPicker('me_pmat', 'ASTM A36'))
+        g = group('Pernos (pretensados)')
+        self.me_bolt = g.add('', BoltPicker('me_perno'))
+        self.me_bolt.grade.setCurrentText('Grupo 150 (A490 / F3125)')
+        self.me_bolt.diam.setCurrentText('M24')
+        self.me_g = g.add('Gramil g', num('me_g', 140, 20, 1000, 0, 'mm'))
+        self.me_pfi = g.add('pfi (ala a fila interior)', num('me_pfi', 50, 10, 300, 1, 'mm'))
+        self.me_pfo = g.add('pfo (ala a fila exterior)', num('me_pfo', 50, 10, 300, 1, 'mm'))
+        self.me_de = g.add('de (fila exterior al borde)', num('me_de', 40, 10, 300, 1, 'mm'))
+        g = group('Soldadura del alma y solicitaciones')
+        self.me_w = g.add('Filete del alma w', num('me_w', 6, 1, 50, 1, 'mm'))
+        self.me_E = g.add('Electrodo', combo('me_elec', list(ELECTRODOS.keys()), 'E70XX'))
+        self.me_M = g.add('Momento M', num('me_M', 200, 0, 1e5, 2, 'kN·m', 10))
+        self.me_V = g.add('Cortante V', num('me_V', 100, 0, 1e5, 2, 'kN', 10))
+
     def compute(self):
+        method = self.method.currentText()
+        kind = self.ctype.currentText()
+        head = [('Conexión', [('Tipo', kind, ''), ('Método de diseño', method, '')])]
+        if kind == CONN_DOUBLE_ANGLE:
+            beam, ang = self._I(self.da_beam), self.da_angle.section()
+            bFy, bFu = self.da_beam_mat.values()
+            aFy, aFu = self.da_amat.values()
+            inp = C.DoubleAngleInput(beam=beam, beam_Fy=bFy, beam_Fu=bFu, angle=ang, angle_Fy=aFy, angle_Fu=aFu,
+                                     bolt=self.da_bolt.bolt(), n_rows=self.da_n.value(), pitch=self.da_s.value(),
+                                     Lev=self.da_Lev.value(), Leh_beam_leg=self.da_Lehb.value(),
+                                     Leh_support_leg=self.da_Lehs.value(), Leh_beam=self.da_Lehbeam.value(),
+                                     support_t=self.da_tsup.value(), support_Fu=self.da_Fusup.value(),
+                                     V=self.da_V.value() * 1e3, ecc=self.da_e.value(), method=method,
+                                     deformation_considered=self.da_bolt.deform.isChecked())
+            inputs = head + [('Viga', self.da_beam.describe() + self.da_beam_mat.describe()),
+                             ('Ángulos', self.da_angle.describe() + self.da_amat.describe()),
+                             ('Pernos', self.da_bolt.describe() + [('Filas', self.da_n.value(), ''),
+                                                                   ('Paso', self.da_s.value(), 'mm')]),
+                             ('Solicitación', [('V', self.da_V.value(), 'kN')])]
+            return inputs, C.check_double_angle(inp), beam, None, method
+        if kind == CONN_SHEAR_END_PLATE:
+            beam = self._I(self.se_beam)
+            bFy, bFu = self.se_beam_mat.values()
+            pFy, pFu = self.se_pmat.values()
+            inp = C.ShearEndPlateInput(beam=beam, beam_Fy=bFy, beam_Fu=bFu, plate_t=self.se_tp.value(),
+                                       plate_width=self.se_bp.value(), plate_Fy=pFy, plate_Fu=pFu,
+                                       bolt=self.se_bolt.bolt(), n_rows=self.se_n.value(), pitch=self.se_s.value(),
+                                       Lev=self.se_Lev.value(), gauge=self.se_g.value(), weld_size=self.se_w.value(),
+                                       FEXX=ELECTRODOS[self.se_E.currentText()], support_t=self.se_tsup.value(),
+                                       support_Fu=self.se_Fusup.value(), V=self.se_V.value() * 1e3, method=method,
+                                       deformation_considered=self.se_bolt.deform.isChecked())
+            inputs = head + [('Viga', self.se_beam.describe() + self.se_beam_mat.describe()),
+                             ('Placa', [('tp', self.se_tp.value(), 'mm'), ('bp', self.se_bp.value(), 'mm')]
+                              + self.se_pmat.describe()),
+                             ('Pernos', self.se_bolt.describe() + [('Filas', self.se_n.value(), ''),
+                                                                   ('Gramil', self.se_g.value(), 'mm')]),
+                             ('Solicitación', [('V', self.se_V.value(), 'kN')])]
+            return inputs, C.check_shear_end_plate(inp), beam, None, method
+        if kind == CONN_SEATED:
+            beam, ang = self._I(self.sa_beam), self.sa_angle.section()
+            bFy, _ = self.sa_beam_mat.values()
+            aFy, aFu = self.sa_amat.values()
+            inp = C.SeatedAngleInput(beam=beam, beam_Fy=bFy, angle=ang, angle_Fy=aFy, angle_Fu=aFu,
+                                     bolt=self.sa_bolt.bolt(), angle_length=self.sa_len.value(),
+                                     setback=self.sa_setback.value(), n_bolts=self.sa_nb.value(),
+                                     outstanding_short_leg=self.sa_short.isChecked(), support_t=self.sa_tsup.value(),
+                                     support_Fu=self.sa_Fusup.value(), V=self.sa_V.value() * 1e3, method=method)
+            inputs = head + [('Viga', self.sa_beam.describe() + self.sa_beam_mat.describe()),
+                             ('Ángulo de asiento', self.sa_angle.describe() + self.sa_amat.describe() +
+                              [('Longitud', self.sa_len.value(), 'mm')]),
+                             ('Solicitación', [('V', self.sa_V.value(), 'kN')])]
+            return inputs, C.check_seated_angle(inp), beam, None, method
+        if kind == CONN_SPLICE:
+            mem = self._I(self.sp_mem)
+            Fy, Fu = self.sp_mat.values()
+            pFy, pFu = self.sp_pmat.values()
+            sign = 1 if self.sp_Pt.currentText() == 'Tracción' else -1
+            inp = C.BoltedSpliceInput(member=mem, Fy=Fy, Fu=Fu, fp_width=self.sp_fpb.value(), fp_t=self.sp_fpt.value(),
+                                      fp_Fy=pFy, fp_Fu=pFu, wp_height=self.sp_wph.value(), wp_t=self.sp_wpt.value(),
+                                      flange_bolt=self.sp_fbolt.bolt(), web_bolt=self.sp_wbolt.bolt(),
+                                      nf_rows=self.sp_nfr.value(), nf_lines=self.sp_nfl.value(),
+                                      f_pitch=self.sp_fs.value(), f_end=self.sp_fe.value(), f_gauge=self.sp_fg.value(),
+                                      gap=self.sp_gap.value(), nw_rows=self.sp_nwr.value(), nw_cols=self.sp_nwc.value(),
+                                      w_pitch=self.sp_ws.value(), w_gauge=self.sp_wg.value(), w_end=self.sp_we.value(),
+                                      M=self.sp_M.value() * 1e6, V=self.sp_V.value() * 1e3,
+                                      P=sign * self.sp_P.value() * 1e3, method=method,
+                                      deformation_considered=self.sp_fbolt.deform.isChecked())
+            inputs = head + [('Miembro (%s)' % self.sp_kind.currentText().lower(),
+                              self.sp_mem.describe() + self.sp_mat.describe()),
+                             ('Cubreplacas', [('Placa de ala', '%.0f x %.1f' % (self.sp_fpb.value(), self.sp_fpt.value()),
+                                               'mm'), ('Placas de alma', '2 x %.0f x %.1f' % (self.sp_wph.value(),
+                                                                                             self.sp_wpt.value()), 'mm')]
+                              + self.sp_pmat.describe()),
+                             ('Pernos de ala', self.sp_fbolt.describe()), ('Pernos de alma', self.sp_wbolt.describe()),
+                             ('Solicitaciones', [('M', self.sp_M.value(), 'kN·m'), ('V', self.sp_V.value(), 'kN'),
+                                                 ('P (%s)' % self.sp_Pt.currentText().lower(), self.sp_P.value(), 'kN')])]
+            return inputs, C.check_bolted_splice(inp), mem, None, method
+        if kind == CONN_MOMENT_END_PLATE:
+            beam = self._I(self.me_beam)
+            bFy, _ = self.me_beam_mat.values()
+            pFy, pFu = self.me_pmat.values()
+            bc = self.me_where.currentIndex() == 1
+            col = self._I(self.me_col) if bc else None
+            cFy = self.me_col_mat.values()[0] if bc else 0.0
+            inp = C.MomentEndPlateInput(beam=beam, beam_Fy=bFy, plate_Fy=pFy, plate_Fu=pFu, bp=self.me_bp.value(),
+                                        tp=self.me_tp.value(), bolt=self.me_bolt.bolt(), config=self.me_cfg.currentText(),
+                                        g=self.me_g.value(), pfi=self.me_pfi.value(), pfo=self.me_pfo.value(),
+                                        de=self.me_de.value(), M=self.me_M.value() * 1e6, V=self.me_V.value() * 1e3,
+                                        method=method, web_weld=self.me_w.value(),
+                                        FEXX=ELECTRODOS[self.me_E.currentText()], column=col, column_Fy=cFy)
+            inputs = head + [('Configuración', [('Conexión', self.me_where.currentText(), ''),
+                                                ('Placa', self.me_cfg.currentText(), '')]),
+                             ('Viga', self.me_beam.describe() + self.me_beam_mat.describe())] + \
+                ([('Columna', self.me_col.describe() + self.me_col_mat.describe())] if bc else []) + \
+                [('Placa de extremo', [('bp', self.me_bp.value(), 'mm'), ('tp', self.me_tp.value(), 'mm')]
+                  + self.me_pmat.describe()),
+                 ('Pernos', self.me_bolt.describe() + [('g', self.me_g.value(), 'mm'), ('pfi', self.me_pfi.value(), 'mm'),
+                                                       ('pfo', self.me_pfo.value(), 'mm')]),
+                 ('Solicitaciones', [('M', self.me_M.value(), 'kN·m'), ('V', self.me_V.value(), 'kN')])]
+            return inputs, C.check_moment_end_plate(inp), beam, None, method
+        return self._compute_basic()
+
+    @staticmethod
+    def _I(picker):
+        s = picker.section()
+        if not isinstance(s, S.ISection):
+            raise ValueError('Se requiere un perfil I.')
+        return s
+
+    def _compute_basic(self):
         method = self.method.currentText()
         kind = self.ctype.currentText()
         head = [('Conexión', [('Tipo', kind, ''), ('Método de diseño', method, '')])]

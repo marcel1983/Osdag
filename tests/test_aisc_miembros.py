@@ -155,3 +155,17 @@ def test_base_de_datos_osdag():
     assert sec.A == pytest.approx(9220, rel=0.02)
     res = check_member(MemberInput(section=sec, Fy=250, Fu=410, Mx=150e6, Vy=100e3, Lb=3000))
     assert res.checks and all(c.capacity > 0 for c in res.checks)
+
+
+def test_catalogo_aisc():
+    from osdag.aisc import catalogo as K
+    assert len(K.list_designations(S.I_SHAPE)) > 300
+    w = K.from_catalog('W14X132')
+    assert w.A / IN ** 2 == pytest.approx(38.8, rel=0.005)
+    L = 30 * 12 * IN
+    res = check_member(_inp(w, P=-500e3, Lx=L, Ly=L, Lz=L))
+    assert _check(res, 'E3').capacity * 1e3 / KIP == pytest.approx(892, rel=0.01)
+    hss = K.from_catalog('HSS8X8X1/2')
+    assert hss.t / IN == pytest.approx(0.465, rel=0.01)
+    for name in ('L4X4X1/2', 'C12X30', 'Pipe4STD', 'HSS6.625X0.280'):
+        assert K.from_catalog(name) is not None

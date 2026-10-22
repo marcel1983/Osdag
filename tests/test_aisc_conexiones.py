@@ -120,3 +120,72 @@ def test_placa_base_DG1():
     # m = (18 − 0.95·12.7)/2 = 2.97 in ; n = (18 − 0.8·12.2)/2 = 4.12 in -> l ≈ 4.12 in
     # tmín = 4.12·√(2·700/(0.9·36·324)) = 1.51 in
     assert t.demand / IN == pytest.approx(1.51, rel=0.02)
+
+
+# ---------------------------------------------------------------------------------------------
+# Conexiones agregadas para los submódulos de Osdag en modo AISC
+# ---------------------------------------------------------------------------------------------
+from osdag.aisc import catalogo as K
+from osdag.aisc.conexiones import (DoubleAngleInput, check_double_angle, ShearEndPlateInput, check_shear_end_plate,
+                                   SeatedAngleInput, check_seated_angle, BoltedSpliceInput, check_bolted_splice,
+                                   MomentEndPlateInput, check_moment_end_plate, ENDPLATE_4E, ENDPLATE_FLUSH)
+
+A325 = 'Grupo 120 (A325 / F3125)'
+
+
+def test_angulos_dobles():
+    beam = K.from_catalog('W18X50')
+    res = check_double_angle(DoubleAngleInput(beam=beam, beam_Fy=345, beam_Fu=450, angle=K.from_catalog('L4X3-1/2X3/8'),
+                                              angle_Fy=250, angle_Fu=400, bolt=Bolt(A325, '3/4 in'), n_rows=3,
+                                              pitch=76.2, Lev=31.75, Leh_beam_leg=31.75, Leh_support_leg=31.75,
+                                              support_t=12, support_Fu=450, V=150e3))
+    bolts = res.checks[0]
+    # 3 pernos A325-N 3/4" en corte doble: 3 × 35.8 kips = 107 kips (si gobierna el corte)
+    assert bolts.capacity * 1e3 / KIP <= 3 * 35.8 + 0.5
+    assert all(c.capacity > 0 for c in res.checks)
+
+
+def test_placa_extremo_cortante():
+    beam = K.from_catalog('W18X50')
+    res = check_shear_end_plate(ShearEndPlateInput(beam=beam, beam_Fy=345, beam_Fu=450, plate_t=6.35, plate_width=203,
+                                                   plate_Fy=250, plate_Fu=400, bolt=Bolt(A325, '3/4 in'), n_rows=3,
+                                                   pitch=76.2, Lev=31.75, gauge=139.7, weld_size=5, V=150e3))
+    assert res.governing.ratio > 0 and len(res.checks) >= 7
+
+
+def test_angulo_asiento():
+    beam = K.from_catalog('W16X26')
+    res = check_seated_angle(SeatedAngleInput(beam=beam, beam_Fy=345, angle=K.from_catalog('L6X4X5/8'), angle_Fy=250,
+                                              angle_Fu=400, bolt=Bolt(A325, '3/4 in'), angle_length=203, setback=19,
+                                              n_bolts=2, V=100e3))
+    names = [c.name for c in res.checks]
+    assert any('fluencia local' in n for n in names) and any('flexión del ala saliente' in n for n in names)
+
+
+def test_empalme_atornillado():
+    beam = K.from_catalog('W18X50')
+    res = check_bolted_splice(BoltedSpliceInput(member=beam, Fy=345, Fu=450, fp_width=190, fp_t=16, fp_Fy=345,
+                                                fp_Fu=450, wp_height=300, wp_t=8, flange_bolt=Bolt(A325, 'M20'),
+                                                web_bolt=Bolt(A325, 'M20'), M=150e6, V=100e3))
+    ff = res.geometry[0][1]
+    assert ff == pytest.approx(150e6 / (beam.d + 16) / 1e3, rel=1e-6)
+    assert any('Placa de ala' in c.name for c in res.checks)
+
+
+def test_placa_extremo_momento_4E_DG16():
+    # Comparación con la fórmula de Yp del DG16 (4E) evaluada a mano en pulgadas
+    IN = 25.4
+    beam = K.from_catalog('W18X50')
+    inp = MomentEndPlateInput(beam=beam, beam_Fy=345, plate_Fy=250, plate_Fu=400, bp=7.75 * IN, tp=0.75 * IN,
+                              bolt=Bolt('Grupo 150 (A490 / F3125)', '1 in'), config=ENDPLATE_4E, g=5.5 * IN,
+                              pfi=1.75 * IN, pfo=1.75 * IN, de=1.5 * IN, M=300e6, V=100e3)
+    res = check_moment_end_plate(inp)
+    d, tf = 18.0, 0.570
+    h1, h0 = d - 1.5 * tf - 1.75, d - tf / 2 + 1.75
+    s = 0.5 * (7.75 * 5.5) ** 0.5
+    Yp = 7.75 / 2 * (h1 * (1 / 1.75 + 1 / s) + h0 / 1.75 - 0.5) + 2 / 5.5 * h1 * (1.75 + s)
+    yp_mm = [v for n, v, u in res.geometry if n.startswith('Yp')][0]
+    assert yp_mm / IN == pytest.approx(Yp, rel=0.01)
+    res2 = check_moment_end_plate(MomentEndPlateInput(**{**inp.__dict__, 'config': ENDPLATE_FLUSH,
+                                                         'column': K.from_catalog('W14X90'), 'column_Fy': 345}))
+    assert any('Columna' in c.name for c in res2.checks)

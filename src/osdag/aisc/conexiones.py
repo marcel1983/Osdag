@@ -619,3 +619,485 @@ def check_base_plate(inp: BasePlateInput) -> Result:
     res.notes.append('Columna con carga axial de compresión concéntrica únicamente; para momento o tracción use '
                      'el procedimiento de DG1 sección 4.3.3 y ACI 318 (Cap. 17) para anclajes.')
     return res
+
+
+# =============================================================================================
+# 5. Ángulos dobles de cortante (cleat angles) — Manual AISC, Parte 10
+# =============================================================================================
+@dataclass
+class DoubleAngleInput:
+    beam: S.ISection
+    beam_Fy: float
+    beam_Fu: float
+    angle: S.AngleSection
+    angle_Fy: float
+    angle_Fu: float
+    bolt: Bolt
+    n_rows: int = 3
+    pitch: float = 75.0
+    Lev: float = 32.0            # distancia vertical al borde del ángulo
+    Leh_beam_leg: float = 32.0   # eje de pernos al borde del ala del ángulo (lado viga)
+    Leh_support_leg: float = 32.0
+    Leh_beam: float = 38.0       # eje de pernos al extremo de la viga
+    gauge_support: float = 140.0  # gramil entre líneas de pernos en el apoyo (entre ángulos)
+    support_t: float = 0.0
+    support_Fu: float = 0.0
+    V: float = 0.0
+    ecc: float = 0.0             # excentricidad en los pernos del lado viga (0 = se ignora, Manual Tabla 10-1)
+    method: str = LRFD
+    deformation_considered: bool = True
+
+
+def check_double_angle(inp: DoubleAngleInput) -> Result:
+    res = Result()
+    b, m, L, beam = inp.bolt, inp.method, inp.angle, inp.beam
+    n = inp.n_rows
+    ta = L.t
+    La = (n - 1) * inp.pitch + 2 * inp.Lev
+    d, dh = b.d, b.dh
+    res.geometry += [('Longitud de los ángulos La', La, 'mm'), ('Espesor de los ángulos', ta, 'mm'),
+                     ('Pernos en el alma de la viga (corte doble)', n, ''), ('Pernos en el apoyo', 2 * n, '')]
+    res.limits.append(Limit('Longitud del ángulo ≤ altura libre del alma T', 'Geometría', La, beam.h, 'max', 'mm'))
+    res.limits.append(Limit('(Rec.) Longitud del ángulo ≥ T/2', 'Manual Parte 10', La, beam.h / 2, 'min', 'mm'))
+    res.limits += bolt_spacing_limits(b, [inp.pitch], [inp.Lev, inp.Leh_beam_leg, inp.Leh_support_leg], ta)
+    res.limits.append(Limit('Viga: distancia mínima al extremo', 'J3.4', inp.Leh_beam, min_edge_distance(d), 'min', 'mm'))
+
+    # --- Pernos en el alma de la viga: corte doble ---
+    bd = Bolt(b.grade, b.diameter, b.threads, b.hole, b.slip_critical, b.slip_class, 2)
+    sh2 = bd.shear().Rn
+    lc_e, lc_i = inp.Lev - dh / 2, inp.pitch - dh
+    web = A.J3_bearing_tearout(d, beam.tw, inp.beam_Fu, lc_i, inp.deformation_considered).Rn
+    ang_e = 2 * A.J3_bearing_tearout(d, ta, inp.angle_Fu, lc_e, inp.deformation_considered).Rn
+    ang_i = 2 * A.J3_bearing_tearout(d, ta, inp.angle_Fu, lc_i, inp.deformation_considered).Rn
+    rn_e, rn_i = min(sh2, web, ang_e), min(sh2, web, ang_i)
+    C = ic_coefficient([(0.0, i * inp.pitch) for i in range(n)], inp.ecc) if inp.ecc > 0 else float(n)
+    Rn = rn_e + (n - 1) * rn_i if inp.ecc <= 0 else C * min(rn_e, rn_i)
+    steps = ['Corte doble por perno = %.1f kN ; aplastamiento en el alma = %.1f kN ; en 2 ángulos: borde %.1f, '
+             'interior %.1f kN' % (_kN(sh2), _kN(web), _kN(ang_e), _kN(ang_i))]
+    steps.append(('Sin excentricidad (Manual Tabla 10-1): Rn = Σ min = %.1f kN' % _kN(Rn)) if inp.ecc <= 0 else
+                 ('e = %.0f mm → C = %.3f ; Rn = C·rn,mín = %.1f kN' % (inp.ecc, C, _kN(Rn))))
+    res.checks.append(_chk('Pernos lado viga (corte doble + aplastamiento)', 'J3.6, J3.11', inp.V,
+                           Nominal(Rn, 0.75, 2.00, steps), m))
+    # --- Pernos en el apoyo: 2n pernos en corte simple ---
+    sh1 = b.shear().Rn
+    a_e = A.J3_bearing_tearout(d, ta, inp.angle_Fu, lc_e, inp.deformation_considered).Rn
+    a_i = A.J3_bearing_tearout(d, ta, inp.angle_Fu, lc_i, inp.deformation_considered).Rn
+    sup = A.J3_bearing_tearout(d, inp.support_t, inp.support_Fu, lc_i, inp.deformation_considered).Rn \
+        if inp.support_t > 0 and inp.support_Fu > 0 else float('inf')
+    Rn = 2 * (min(sh1, a_e, sup) + (n - 1) * min(sh1, a_i, sup))
+    res.checks.append(_chk('Pernos lado apoyo (2n en corte simple + aplastamiento)', 'J3.6, J3.11', inp.V,
+                           Nominal(Rn, 0.75, 2.00, ['Corte simple = %.1f kN ; aplastamiento ángulo borde/interior = '
+                                                    '%.1f/%.1f kN%s' % (_kN(sh1), _kN(a_e), _kN(a_i),
+                                                                       '' if sup == float('inf') else
+                                                                       ' ; apoyo = %.1f kN' % _kN(sup)),
+                                                    'Rn = 2·Σ min = %.1f kN' % _kN(Rn)]), m))
+    if b.slip_critical:
+        sl = b.slip()
+        res.checks.append(_chk('Deslizamiento crítico (lado apoyo)', 'J3.9', inp.V,
+                               Nominal(2 * n * sl.Rn, sl.phi, sl.omega, sl.steps + ['× %d pernos' % (2 * n)]), m))
+    # --- Ángulos ---
+    Agv = 2 * La * ta
+    Anv = 2 * (La - n * b.dh_net) * ta
+    res.checks.append(_chk('Ángulos: fluencia por corte', 'J4.2(a)', inp.V, A.J4_2_shear_yielding(inp.angle_Fy, Agv), m))
+    res.checks.append(_chk('Ángulos: rotura por corte', 'J4.2(b)', inp.V, A.J4_2_shear_rupture(inp.angle_Fu, Anv), m))
+    for leg, Leh in (('lado viga', inp.Leh_beam_leg), ('lado apoyo', inp.Leh_support_leg)):
+        Agv_b = 2 * (La - inp.Lev) * ta
+        Anv_b = Agv_b - 2 * (n - 0.5) * b.dh_net * ta
+        Ant_b = 2 * (Leh - 0.5 * b.dh_net) * ta
+        res.checks.append(_chk('Ángulos: bloque de corte (%s)' % leg, 'J4.3', inp.V,
+                               A.J4_3_block_shear(inp.angle_Fy, inp.angle_Fu, Agv_b, Anv_b, Ant_b, 1.0), m))
+    # --- Viga ---
+    res.checks.append(_chk('Viga: fluencia por corte del alma', 'J4.2(a)', inp.V,
+                           A.J4_2_shear_yielding(inp.beam_Fy, beam.d * beam.tw), m))
+    res.notes.append('Viga sin despatinar. Ángulos simétricos a ambos lados del alma.')
+    return res
+
+
+# =============================================================================================
+# 6. Placa de extremo a cortante (shear end plate) — Manual AISC, Parte 10
+# =============================================================================================
+@dataclass
+class ShearEndPlateInput:
+    beam: S.ISection
+    beam_Fy: float
+    beam_Fu: float
+    plate_t: float
+    plate_width: float
+    plate_Fy: float
+    plate_Fu: float
+    bolt: Bolt
+    n_rows: int = 3
+    pitch: float = 75.0
+    Lev: float = 32.0
+    gauge: float = 140.0        # separación entre las dos líneas verticales de pernos
+    weld_size: float = 6.0
+    FEXX: float = 480.0
+    support_t: float = 0.0
+    support_Fu: float = 0.0
+    V: float = 0.0
+    method: str = LRFD
+    deformation_considered: bool = True
+
+
+def check_shear_end_plate(inp: ShearEndPlateInput) -> Result:
+    res = Result()
+    b, m, beam = inp.bolt, inp.method, inp.beam
+    n = inp.n_rows
+    tp, bp = inp.plate_t, inp.plate_width
+    Lp = (n - 1) * inp.pitch + 2 * inp.Lev
+    Leh = (bp - inp.gauge) / 2
+    d, dh = b.d, b.dh
+    res.geometry += [('Altura de la placa Lp', Lp, 'mm'), ('Ancho de la placa bp', bp, 'mm'),
+                     ('Distancia horizontal al borde Leh', Leh, 'mm'), ('Número de pernos', 2 * n, '')]
+    res.limits.append(Limit('Altura de placa ≤ altura libre del alma T', 'Geometría', Lp, beam.h, 'max', 'mm'))
+    res.limits.append(Limit('Gramil ≥ tw + 2·(espacio para llave)', 'Detallado', inp.gauge, beam.tw + 2 * 1.75 * d, 'min',
+                            'mm'))
+    res.limits += bolt_spacing_limits(b, [inp.pitch], [inp.Lev, Leh], tp)
+    sh = b.shear().Rn
+    pe = A.J3_bearing_tearout(d, tp, inp.plate_Fu, inp.Lev - dh / 2, inp.deformation_considered).Rn
+    pi = A.J3_bearing_tearout(d, tp, inp.plate_Fu, inp.pitch - dh, inp.deformation_considered).Rn
+    sup = A.J3_bearing_tearout(d, inp.support_t, inp.support_Fu, inp.pitch - dh, inp.deformation_considered).Rn \
+        if inp.support_t > 0 and inp.support_Fu > 0 else float('inf')
+    Rn = 2 * (min(sh, pe, sup) + (n - 1) * min(sh, pi, sup))
+    res.checks.append(_chk('Pernos (corte + aplastamiento en placa y apoyo)', 'J3.6, J3.11', inp.V,
+                           Nominal(Rn, 0.75, 2.00, ['Corte = %.1f kN ; placa borde/interior = %.1f/%.1f kN'
+                                                    % (_kN(sh), _kN(pe), _kN(pi)),
+                                                    'Rn = 2 líneas × Σ min = %.1f kN' % _kN(Rn)]), m))
+    if b.slip_critical:
+        sl = b.slip()
+        res.checks.append(_chk('Deslizamiento crítico', 'J3.9', inp.V,
+                               Nominal(2 * n * sl.Rn, sl.phi, sl.omega, sl.steps + ['× %d pernos' % (2 * n)]), m))
+    Agv = 2 * Lp * tp
+    Anv = 2 * (Lp - n * b.dh_net) * tp
+    res.checks.append(_chk('Placa: fluencia por corte', 'J4.2(a)', inp.V, A.J4_2_shear_yielding(inp.plate_Fy, Agv), m))
+    res.checks.append(_chk('Placa: rotura por corte', 'J4.2(b)', inp.V, A.J4_2_shear_rupture(inp.plate_Fu, Anv), m))
+    Agv_b = 2 * (Lp - inp.Lev) * tp
+    Anv_b = Agv_b - 2 * (n - 0.5) * b.dh_net * tp
+    Ant_b = 2 * (Leh - 0.5 * b.dh_net) * tp
+    res.checks.append(_chk('Placa: bloque de corte', 'J4.3', inp.V,
+                           A.J4_3_block_shear(inp.plate_Fy, inp.plate_Fu, Agv_b, Anv_b, Ant_b, 1.0), m))
+    w = inp.weld_size
+    Lw = Lp - 2 * w
+    res.limits.append(Limit('Soldadura: tamaño mínimo', 'J2.2b', w, A.J2_min_fillet(min(tp, beam.tw)), 'min', 'mm'))
+    res.checks.append(_chk('Soldadura alma-placa (2 cordones, L = Lp − 2w)', 'J2.4', inp.V,
+                           A.J2_fillet(w, Lw, inp.FEXX, 0.0, 2), m))
+    res.checks.append(_chk('Alma de la viga: rotura por corte junto a la soldadura', 'J4.2(b)', inp.V,
+                           A.J4_2_shear_rupture(inp.beam_Fu, beam.tw * Lw), m))
+    res.checks.append(_chk('Viga: fluencia por corte del alma', 'J4.2(a)', inp.V,
+                           A.J4_2_shear_yielding(inp.beam_Fy, beam.d * beam.tw), m))
+    return res
+
+
+# =============================================================================================
+# 7. Ángulo de asiento no rigidizado (unstiffened seated) — Manual AISC, Parte 10
+# =============================================================================================
+@dataclass
+class SeatedAngleInput:
+    beam: S.ISection
+    beam_Fy: float
+    angle: S.AngleSection
+    angle_Fy: float
+    angle_Fu: float
+    bolt: Bolt
+    angle_length: float = 200.0     # longitud del ángulo a lo largo del ancho de la viga
+    setback: float = 19.0           # holgura entre extremo de la viga y el apoyo
+    n_bolts: int = 4                # pernos en el ala vertical
+    outstanding_short_leg: bool = True
+    support_t: float = 0.0
+    support_Fu: float = 0.0
+    V: float = 0.0
+    method: str = LRFD
+
+
+def check_seated_angle(inp: SeatedAngleInput) -> Result:
+    res = Result()
+    m, beam, L, b = inp.method, inp.beam, inp.angle, inp.bolt
+    t = L.t
+    leg_out = L.b_short if inp.outstanding_short_leg else L.b_long
+    la = inp.angle_length
+    lb_av = leg_out - inp.setback
+    k = beam.tf + beam.r
+    res.geometry += [('Ala saliente del ángulo', leg_out, 'mm'), ('Longitud de apoyo disponible lb', lb_av, 'mm'),
+                     ('k de la viga', k, 'mm')]
+    res.limits.append(Limit('Longitud del ángulo ≥ ancho del ala de la viga', 'Detallado', la, beam.bf, 'min', 'mm'))
+    # Longitud de apoyo requerida (fluencia y aplastamiento del alma, en el extremo)
+    def avail_wly(lb):
+        return A.J10_2_web_local_yielding(inp.beam_Fy, beam.tw, k, lb, True).available(m)
+
+    def avail_wcr(lb):
+        return A.J10_3_web_crippling(beam.tw, beam.tf, beam.d, lb, inp.beam_Fy, True).available(m)
+    lb_req = k
+    for lb in [k + i * 0.5 for i in range(4000)]:
+        if avail_wly(lb) >= inp.V and avail_wcr(lb) >= inp.V:
+            lb_req = lb
+            break
+    else:
+        lb_req = float('inf')
+    res.checks.append(_chk('Viga: fluencia local del alma (lb disponible)', 'J10.2', inp.V,
+                           A.J10_2_web_local_yielding(inp.beam_Fy, beam.tw, k, lb_av, True), m))
+    res.checks.append(_chk('Viga: aplastamiento del alma (lb disponible)', 'J10.3', inp.V,
+                           A.J10_3_web_crippling(beam.tw, beam.tf, beam.d, lb_av, inp.beam_Fy, True), m))
+    res.limits.append(Limit('Longitud de apoyo requerida ≤ disponible', 'J10.2/J10.3', lb_req, lb_av, 'max', 'mm'))
+    # Flexión y corte del ala saliente (sección crítica a t + 9.5 mm del dorso del ala vertical)
+    e = max(inp.setback + min(lb_req, lb_av) / 2 - (t + 9.5), 0.0)
+    Mr = inp.V * e
+    nom_m = Nominal(inp.angle_Fy * la * t ** 2 / 4, 0.90, 1.67,
+                    ['e = a + lb,req/2 − (t + 9.5 mm) = %.1f mm ; Mr = V·e = %.2f kN·m' % (e, Mr / 1e6),
+                     'Mn = Fy·La·t²/4 = %.2f kN·m' % (inp.angle_Fy * la * t ** 2 / 4 / 1e6)])
+    res.checks.append(_chk('Ángulo: flexión del ala saliente', 'Manual Parte 10 / F11', Mr, nom_m, m, 'kN·m', 1e6))
+    res.checks.append(_chk('Ángulo: fluencia por corte del ala saliente', 'J4.2(a)', inp.V,
+                           A.J4_2_shear_yielding(inp.angle_Fy, la * t), m))
+    # Pernos en el ala vertical
+    sh = b.shear().Rn
+    br = A.J3_bearing_tearout(b.d, t, inp.angle_Fu, 2 * b.d, True).Rn
+    sup = A.J3_bearing_tearout(b.d, inp.support_t, inp.support_Fu, 2 * b.d, True).Rn \
+        if inp.support_t > 0 and inp.support_Fu > 0 else float('inf')
+    Rn = inp.n_bolts * min(sh, br, sup)
+    res.checks.append(_chk('Pernos en el apoyo', 'J3.6, J3.11', inp.V,
+                           Nominal(Rn, 0.75, 2.00, ['rn = min(corte %.1f, aplastamiento %.1f) kN ; n = %d → Rn = %.1f kN'
+                                                    % (_kN(sh), _kN(br), inp.n_bolts, _kN(Rn))]), m))
+    res.notes.append('Disponga un ángulo superior (p. ej. L100x100x6) para estabilidad lateral del extremo de la viga.')
+    return res
+
+
+# =============================================================================================
+# 8. Empalme con cubreplacas atornilladas (viga o columna)
+# =============================================================================================
+@dataclass
+class BoltedSpliceInput:
+    member: S.ISection
+    Fy: float
+    Fu: float
+    # Placas de ala (exteriores)
+    fp_width: float
+    fp_t: float
+    fp_Fy: float
+    fp_Fu: float
+    # Placas de alma (dos, una a cada lado)
+    wp_height: float
+    wp_t: float
+    flange_bolt: Bolt
+    web_bolt: Bolt
+    nf_rows: int = 3            # filas de pernos (a lo largo) en cada ala, a cada lado del empalme
+    nf_lines: int = 2           # líneas de pernos a lo ancho del ala
+    f_pitch: float = 75.0
+    f_end: float = 40.0
+    f_gauge: float = 100.0      # separación entre líneas en el ala
+    gap: float = 10.0           # separación entre extremos de los miembros
+    nw_rows: int = 3
+    nw_cols: int = 2
+    w_pitch: float = 75.0
+    w_gauge: float = 75.0
+    w_end: float = 40.0
+    M: float = 0.0
+    V: float = 0.0
+    P: float = 0.0              # + tracción, − compresión
+    method: str = LRFD
+    deformation_considered: bool = True
+
+
+def check_bolted_splice(inp: BoltedSpliceInput) -> Result:
+    res = Result()
+    m, sec = inp.method, inp.member
+    fb, wb = inp.flange_bolt, inp.web_bolt
+    Af = sec.bf * sec.tf
+    lever = sec.d + inp.fp_t
+    Ff = abs(inp.M) / lever + abs(inp.P) * Af / sec.A
+    Pw = abs(inp.P) * (sec.A - 2 * Af) / sec.A
+    res.geometry += [('Fuerza en cada ala Ff = M/(d+tp) + P·Af/A', Ff / 1e3, 'kN'),
+                     ('Fuerza axial en el alma', Pw / 1e3, 'kN'), ('Brazo d + tp', lever, 'mm')]
+    nf = inp.nf_rows * inp.nf_lines
+    tension_flange = inp.M != 0 or inp.P > 0
+    # --- Pernos del ala ---
+    res.limits += bolt_spacing_limits(fb, [inp.f_pitch], [inp.f_end], min(sec.tf, inp.fp_t), 'Ala: ')
+    sh = fb.shear().Rn
+    lc_e, lc_i = inp.f_end - fb.dh / 2, inp.f_pitch - fb.dh
+    br_fl_e = A.J3_bearing_tearout(fb.d, sec.tf, inp.Fu, lc_e, inp.deformation_considered).Rn
+    br_fl_i = A.J3_bearing_tearout(fb.d, sec.tf, inp.Fu, lc_i, inp.deformation_considered).Rn
+    br_p_e = A.J3_bearing_tearout(fb.d, inp.fp_t, inp.fp_Fu, lc_e, inp.deformation_considered).Rn
+    br_p_i = A.J3_bearing_tearout(fb.d, inp.fp_t, inp.fp_Fu, lc_i, inp.deformation_considered).Rn
+    Rn = inp.nf_lines * (min(sh, br_fl_e, br_p_e) + (inp.nf_rows - 1) * min(sh, br_fl_i, br_p_i))
+    res.checks.append(_chk('Ala: pernos (corte + aplastamiento)', 'J3.6, J3.11', Ff,
+                           Nominal(Rn, 0.75, 2.00, ['%d pernos por lado del empalme ; corte = %.1f kN' % (nf, _kN(sh)),
+                                                    'Rn = Σ min(corte, aplastamiento ala/placa) = %.1f kN' % _kN(Rn)]),
+                           m))
+    if fb.slip_critical:
+        sl = fb.slip()
+        res.checks.append(_chk('Ala: deslizamiento crítico', 'J3.9', Ff,
+                               Nominal(nf * sl.Rn, sl.phi, sl.omega, sl.steps + ['× %d pernos' % nf]), m))
+    # --- Placa de ala ---
+    Ag = inp.fp_width * inp.fp_t
+    An = (inp.fp_width - inp.nf_lines * fb.dh_net) * inp.fp_t
+    if tension_flange:
+        res.checks.append(_chk('Placa de ala: fluencia por tracción', 'J4.1(a)', Ff,
+                               A.J4_1_tension_yielding(inp.fp_Fy, Ag), m))
+        res.checks.append(_chk('Placa de ala: rotura por tracción', 'J4.1(b)', Ff,
+                               A.J4_1_tension_rupture(inp.fp_Fu, An, Ag, splice=True), m))
+    Lc = 0.65 * (inp.gap + 2 * inp.f_end)
+    res.checks.append(_chk('Placa de ala: compresión', 'J4.4', Ff,
+                           A.J4_4_compression(inp.fp_Fy, Ag, Lc / (inp.fp_t / 12 ** 0.5)), m,
+                           extra_steps=['Lc = 0.65·(holgura + 2·distancia al extremo) = %.1f mm' % Lc]))
+    l = inp.f_end + (inp.nf_rows - 1) * inp.f_pitch
+    e_side = (inp.fp_width - (inp.nf_lines - 1) * inp.f_gauge) / 2
+    Agv = 2 * l * inp.fp_t
+    Anv = Agv - 2 * (inp.nf_rows - 0.5) * fb.dh_net * inp.fp_t
+    blocks = [A.J4_3_block_shear(inp.fp_Fy, inp.fp_Fu, Agv, Anv, 2 * (e_side - 0.5 * fb.dh_net) * inp.fp_t)]
+    if inp.nf_lines > 1:
+        blocks.append(A.J4_3_block_shear(inp.fp_Fy, inp.fp_Fu, Agv, Anv,
+                                         (inp.nf_lines - 1) * (inp.f_gauge - fb.dh_net) * inp.fp_t))
+    if tension_flange:
+        res.checks.append(_chk('Placa de ala: bloque de corte', 'J4.3', Ff, min(blocks, key=lambda x: x.Rn), m))
+        # Ala del miembro
+        e_fl = (sec.bf - (inp.nf_lines - 1) * inp.f_gauge) / 2
+        Agv_f = 2 * l * sec.tf
+        Anv_f = Agv_f - 2 * (inp.nf_rows - 0.5) * fb.dh_net * sec.tf
+        res.checks.append(_chk('Ala del miembro: bloque de corte', 'J4.3', Ff,
+                               A.J4_3_block_shear(inp.Fy, inp.Fu, Agv_f, Anv_f,
+                                                  2 * (e_fl - 0.5 * fb.dh_net) * sec.tf), m))
+        Afn = (sec.bf - inp.nf_lines * fb.dh_net) * sec.tf
+        res.checks.append(_chk('Ala del miembro: rotura en la sección neta', 'J4.1(b) / F13', Ff,
+                               A.J4_1_tension_rupture(inp.Fu, Afn), m))
+    # --- Alma: pernos en corte doble con excentricidad ---
+    res.limits += bolt_spacing_limits(wb, [inp.w_pitch, inp.w_gauge], [inp.w_end], min(sec.tw, inp.wp_t), 'Alma: ')
+    pts = [(c * inp.w_gauge, r * inp.w_pitch) for r in range(inp.nw_rows) for c in range(inp.nw_cols)]
+    ex = inp.gap / 2 + inp.w_end + (inp.nw_cols - 1) * inp.w_gauge / 2
+    C = ic_coefficient(pts, ex)
+    wb2 = Bolt(wb.grade, wb.diameter, wb.threads, wb.hole, wb.slip_critical, wb.slip_class, 2)
+    rn = min(wb2.shear().Rn, A.J3_bearing_tearout(wb.d, sec.tw, inp.Fu, inp.w_pitch - wb.dh).Rn,
+             2 * A.J3_bearing_tearout(wb.d, inp.wp_t, inp.fp_Fu, inp.w_pitch - wb.dh).Rn)
+    Vr = (inp.V ** 2 + Pw ** 2) ** 0.5
+    res.checks.append(_chk('Alma: pernos (corte doble, excéntrico)', 'J3.6, J3.11', Vr,
+                           Nominal(C * rn, 0.75, 2.00, ['e = holgura/2 + extremo + centro del grupo = %.1f mm → C = %.3f'
+                                                        % (ex, C), 'rn = %.1f kN ; Rn = C·rn = %.1f kN'
+                                                        % (_kN(rn), _kN(C * rn)),
+                                                        'Resultante V–P en el alma = %.1f kN' % _kN(Vr)]), m))
+    Agv = 2 * inp.wp_height * inp.wp_t
+    Anv = 2 * (inp.wp_height - inp.nw_rows * wb.dh_net) * inp.wp_t
+    res.limits.append(Limit('Altura de placas de alma ≤ altura libre del alma', 'Geometría', inp.wp_height, sec.h, 'max',
+                            'mm'))
+    if inp.V:
+        res.checks.append(_chk('Placas de alma: fluencia por corte', 'J4.2(a)', inp.V,
+                               A.J4_2_shear_yielding(inp.fp_Fy, Agv), m))
+        res.checks.append(_chk('Placas de alma: rotura por corte', 'J4.2(b)', inp.V,
+                               A.J4_2_shear_rupture(inp.fp_Fu, Anv), m))
+        res.checks.append(_chk('Miembro: fluencia por corte del alma', 'J4.2(a)', inp.V,
+                               A.J4_2_shear_yielding(inp.Fy, sec.d * sec.tw), m))
+    res.notes.append('Fuerzas de ala calculadas con el par M/(d + tp) más la fracción axial Af/A; la fracción axial del '
+                     'alma se combina vectorialmente con el corte.')
+    return res
+
+
+# =============================================================================================
+# 9. Placa de extremo a momento (AISC Design Guide 16 / 4): 4E extendida y enrasada de 2 pernos
+# =============================================================================================
+ENDPLATE_4E = 'Extendida 4E (4 pernos, sin rigidizar)'
+ENDPLATE_FLUSH = 'Enrasada 2 pernos (sin rigidizar)'
+
+
+@dataclass
+class MomentEndPlateInput:
+    beam: S.ISection
+    beam_Fy: float
+    plate_Fy: float
+    plate_Fu: float
+    bp: float
+    tp: float
+    bolt: Bolt
+    config: str = ENDPLATE_4E
+    g: float = 140.0          # gramil horizontal
+    pfi: float = 50.0         # cara interior del ala traccionada a la fila interior
+    pfo: float = 50.0         # cara exterior del ala traccionada a la fila exterior
+    de: float = 40.0          # fila exterior al borde de la extensión
+    M: float = 0.0
+    V: float = 0.0
+    method: str = LRFD
+    web_weld: float = 6.0
+    FEXX: float = 480.0
+    # Lado columna (0 = empalme viga-viga, no se verifica)
+    column: S.ISection = None
+    column_Fy: float = 0.0
+
+
+def check_moment_end_plate(inp: MomentEndPlateInput) -> Result:
+    res = Result()
+    m, beam, b = inp.method, inp.beam, inp.bolt
+    d, tf, bf = beam.d, beam.tf, beam.bf
+    four_e = inp.config == ENDPLATE_4E
+    h1 = d - 1.5 * tf - inp.pfi
+    h0 = d - tf / 2 + inp.pfo
+    bp, g, pfi, pfo, tp = inp.bp, inp.g, inp.pfi, inp.pfo, inp.tp
+    s = 0.5 * (bp * g) ** 0.5
+    pfi_e = min(pfi, s)
+    if four_e:
+        Yp = bp / 2 * (h1 * (1 / pfi_e + 1 / s) + h0 * (1 / pfo) - 0.5) + 2 / g * (h1 * (pfi_e + s))
+        hsum = h0 + h1
+        gamma_r = 1.0
+    else:
+        Yp = bp / 2 * (h1 * (1 / pfi_e + 1 / s) - 0.5) + 2 / g * (h1 * (pfi_e + s))
+        hsum = h1
+        gamma_r = 1.25
+    res.geometry += [('h0 (fila exterior)', h0 if four_e else 0.0, 'mm'), ('h1 (fila interior)', h1, 'mm'),
+                     ('s = ½√(bp·g)', s, 'mm'), ('Yp (mecanismo de líneas de fluencia)', Yp, 'mm')]
+    res.limits.append(Limit('Ancho de placa bp ≤ bf + 25 mm', 'DG16', bp, bf + 25, 'max', 'mm'))
+    res.limits.append(Limit('pfi ≤ s', 'DG16', pfi, s, 'max', 'mm'))
+    res.limits.append(Limit('Distancia mínima de la extensión al borde de', 'J3.4', inp.de, min_edge_distance(b.d), 'min',
+                            'mm') if four_e else Limit('(Rec.) pfi ≥ db + 13 mm', 'DG16', pfi, b.d + 13, 'min', 'mm'))
+    # Rotura de pernos sin palanca: Mnp = 2·Pt·Σh
+    Pt = b.g.Fnt * b.Ab
+    Mnp = 2 * Pt * hsum
+    res.checks.append(_chk('Pernos traccionados: rotura sin acción de palanca', 'DG16 ec. 3.4 / J3.6', abs(inp.M),
+                           Nominal(Mnp, 0.75, 2.00, ['Pt = Fnt·Ab = %.1f kN ; Mnp = 2·Pt·Σh = %.2f kN·m'
+                                                     % (Pt / 1e3, Mnp / 1e6)]), m, 'kN·m', 1e6))
+    # Fluencia por flexión de la placa (comportamiento de placa gruesa)
+    Mpl = inp.plate_Fy * tp ** 2 * Yp
+    nom = Nominal(Mpl / gamma_r, 0.90, 1.67, ['Mpl = Fpy·tp²·Yp = %.2f kN·m ; γr = %.2f' % (Mpl / 1e6, gamma_r),
+                                              'Rn = Mpl/γr = %.2f kN·m' % (Mpl / gamma_r / 1e6)])
+    res.checks.append(_chk('Placa de extremo: fluencia por flexión', 'DG16 ec. 3.10', abs(inp.M), nom, m, 'kN·m', 1e6))
+    phi_b = 0.90
+    tp_thick = (1.11 * gamma_r * 0.75 * Mnp / (phi_b * inp.plate_Fy * Yp)) ** 0.5
+    res.limits.append(Limit('(Rec.) tp ≥ tp para placa gruesa (sin palanca)', 'DG16 ec. 3.11', tp, tp_thick, 'min', 'mm'))
+    # Corte en la extensión (4E)
+    Ffu = abs(inp.M) / (d - tf)
+    if four_e:
+        res.checks.append(_chk('Extensión: fluencia por corte', 'J4.2(a)', Ffu / 2,
+                               A.J4_2_shear_yielding(inp.plate_Fy, bp * tp), m))
+        An = tp * (bp - 2 * b.dh_net)
+        res.checks.append(_chk('Extensión: rotura por corte', 'J4.2(b)', Ffu / 2,
+                               A.J4_2_shear_rupture(inp.plate_Fu, An), m))
+    # Corte en los pernos del lado comprimido
+    nb_c = 4 if four_e else 2
+    sh = b.shear().Rn
+    br = A.J3_bearing_tearout(b.d, tp, inp.plate_Fu, 2 * b.d, True).Rn
+    res.checks.append(_chk('Pernos del lado comprimido: corte y aplastamiento', 'J3.6, J3.11', abs(inp.V),
+                           Nominal(nb_c * min(sh, br), 0.75, 2.00, ['nb = %d ; rn = min(%.1f, %.1f) kN'
+                                                                    % (nb_c, _kN(sh), _kN(br))]), m))
+    # Soldadura del alma (corte)
+    Lw = (d / 2 - tf) if abs(inp.V) > 0 else d - 2 * tf
+    res.checks.append(_chk('Soldadura alma-placa (2 cordones, d/2 − tf)', 'J2.4', abs(inp.V),
+                           A.J2_fillet(inp.web_weld, Lw, inp.FEXX, 0.0, 2), m))
+    res.notes.append('Soldadura de alas de la viga a la placa: penetración completa (CJP) recomendada (DG4/DG16).')
+    # Lado de la columna
+    col = inp.column
+    if col is not None and inp.column_Fy > 0:
+        Fyc = inp.column_Fy
+        tcf, bcf = col.tf, col.bf
+        sc = 0.5 * (bcf * g) ** 0.5
+        c = pfo + pfi + tf
+        if four_e:
+            Yc = bcf / 2 * (h1 / sc + h0 / sc) + 2 / g * (h1 * (sc + 3 * c / 4) + h0 * (sc + c / 4) + c ** 2 / 2) + g / 2
+            Mcf = Fyc * tcf ** 2 * Yc
+            res.checks.append(_chk('Columna: flexión del ala (sin rigidizar)', 'DG16 Tabla 3.4', abs(inp.M),
+                                   Nominal(Mcf, 0.90, 1.67, ['Yc = %.1f mm ; Mcf = Fyc·tcf²·Yc = %.2f kN·m'
+                                                             % (Yc, Mcf / 1e6)]), m, 'kN·m', 1e6))
+        else:
+            res.checks.append(_chk('Columna: flexión local del ala', 'J10.1', Ffu,
+                                   A.J10_1_flange_local_bending(Fyc, tcf), m))
+        k = col.tf + col.r
+        lb = tf + 2 * inp.web_weld + 2 * tp
+        res.checks.append(_chk('Columna: fluencia local del alma', 'J10.2', Ffu,
+                               A.J10_2_web_local_yielding(Fyc, col.tw, k, lb), m))
+        res.checks.append(_chk('Columna: aplastamiento del alma', 'J10.3', Ffu,
+                               A.J10_3_web_crippling(col.tw, col.tf, col.d, lb, Fyc), m))
+        res.checks.append(_chk('Columna: corte en la zona de panel', 'J10.6', Ffu,
+                               A.J10_6_panel_zone(Fyc, col.d, col.tw), m))
+    return res

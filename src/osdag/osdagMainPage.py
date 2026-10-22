@@ -180,6 +180,7 @@ from .gui.aisc_ventana import (AISCMemberWindow, AISCConnectionWindow, CONN_SHEA
                                CONN_BASE, CONN_DOUBLE_ANGLE, CONN_SHEAR_END_PLATE, CONN_SEATED, CONN_SPLICE,
                                CONN_MOMENT_END_PLATE, PRESET_COLUMN, PRESET_STRUT, PRESET_BEAM, PRESET_CANTILEVER,
                                PRESET_BEAM_COLUMN, PRESET_GIRDER, PRESET_TENSION)
+from .gui.qt_compat import fix_stylesheet as _fix_qss
 from .gui.selector_norma import CODE_IS, CODE_AISC, ask_code, saved_code
 
 _main_windows = []
@@ -1002,7 +1003,7 @@ def toggle_stylesheet(state):
     file = QFile(theme_path)
     file.open(QFile.ReadOnly | QFile.Text)
     stream = QTextStream(file)
-    app.setStyleSheet(stream.readAll())
+    app.setStyleSheet(_fix_qss(stream.readAll()))
 
 def hook_exception(exc_type, exc_value, tracebackobj):
 
@@ -1089,12 +1090,14 @@ def do_stuff():
     file = QFile(path)
     file.open(QFile.ReadOnly | QFile.Text)
     stream = QTextStream(file)
+    import faulthandler
+    faulthandler.enable()   # si Qt/OpenGL provoca un fallo de segmentación, se muestra dónde ocurrió
     app = QApplication(sys.argv)
     from .gui.qt_compat import apply_safe_font
     apply_safe_font(app)
     from . import i18n
     i18n.install(app)
-    app.setStyleSheet(stream.readAll())
+    app.setStyleSheet(_fix_qss(stream.readAll()))
     app.setStyle('Fusion')
 
     # path = os.path.join(os.path.dirname(__file__), 'ResourceFiles', 'images', 'Osdag.png')

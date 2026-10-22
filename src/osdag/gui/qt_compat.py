@@ -19,3 +19,20 @@ def apply_safe_font(app):
             app.setFont(font)
             return fam
     return None
+
+
+def safe_family():
+    families = set(QtGui.QFontDatabase().families())
+    for fam in _PREFERRED:
+        if fam in families:
+            return fam
+    return None
+
+
+def fix_stylesheet(qss):
+    """Sustituye la familia «Helvetica» de las hojas de estilo de Osdag por una fuente con los glifos
+    técnicos (p. ej. «⁴» en cm⁴); con Helvetica ausente, la búsqueda de respaldo de Qt puede fallar."""
+    fam = safe_family()
+    if fam:
+        qss = qss.replace('font-family: Helvetica', "font-family: '%s'" % fam)
+    return qss
